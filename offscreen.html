@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <title>Course Downloader RNUNES - worker</title>
+  </head>
+  <body>
+    <!--
+      Documento offscreen: existe apenas para baixar os segmentos HLS e montar
+      o arquivo final. Um service worker MV3 nao tem URL.createObjectURL nem
+      garantia de vida longa; este documento resolve os dois problemas.
+    -->
+    <script type="module" src="offscreen.js"></script>
+  </body>
+</html>

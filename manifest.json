@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Course Downloader RNUNES",
+  "version": "3.1.0",
+  "description": "Detecta as aulas de um curso, identifica a melhor qualidade e baixa em lote organizando por Curso/Modulo/Aula.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "webRequest",
+    "storage",
+    "scripting",
+    "downloads",
+    "offscreen",
+    "alarms",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Course Downloader RNUNES",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

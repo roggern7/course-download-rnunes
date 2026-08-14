@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <title>Course Downloader RNUNES</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-dot" aria-hidden="true"></span>
+        <div class="brand-text">
+          <h1>Course Downloader RNUNES</h1>
+          <p id="tab-title" class="brand-sub">Carregando…</p>
+        </div>
+      </div>
+      <button id="clear" class="btn btn-quiet" type="button" title="Limpar as playlists detectadas">
+        Limpar
+      </button>
+    </header>
+
+    <nav class="segmented" role="tablist">
+      <button id="view-current" class="seg is-active" type="button" role="tab" aria-selected="true">
+        Esta aba <span id="count-current" class="pill">0</span>
+      </button>
+      <button id="view-course" class="seg" type="button" role="tab" aria-selected="false">
+        Curso <span id="count-course" class="pill">0</span>
+      </button>
+      <button id="view-all" class="seg" type="button" role="tab" aria-selected="false">
+        Todas <span id="count-all" class="pill">0</span>
+      </button>
+    </nav>
+
+    <!-- Painel unico de atividade: uma barra so, seja fila ou download avulso. -->
+    <section id="activity" class="activity" hidden aria-live="polite">
+      <div class="activity-head">
+        <span id="activity-title" class="activity-title">…</span>
+        <span class="activity-actions">
+          <button id="batch-retry" class="btn btn-quiet btn-small" type="button" hidden>
+            Tentar novamente
+          </button>
+          <button id="batch-pause" class="btn btn-quiet btn-small" type="button" hidden>
+            Pausar
+          </button>
+          <button id="activity-close" class="btn btn-quiet btn-small" type="button">Fechar</button>
+        </span>
+      </div>
+
+      <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div id="activity-bar" class="bar-fill"></div>
+      </div>
+
+      <p id="activity-meta" class="activity-meta"></p>
+      <p id="activity-note" class="activity-note" hidden></p>
+
+      <div id="activity-file" class="activity-file" hidden>
+        <p id="activity-path" class="activity-path"></p>
+        <button id="activity-show" class="btn btn-quiet btn-small" type="button">
+          Mostrar na pasta
+        </button>
+      </div>
+    </section>
+
+    <main id="list" class="list" aria-live="polite"></main>
+
+    <footer id="course-bar" class="actionbar" hidden>
+      <div class="actionbar-links">
+        <button id="select-all" class="link-btn" type="button">Todas</button>
+        <button id="select-none" class="link-btn" type="button">Nenhuma</button>
+        <button id="rescan" class="link-btn" type="button">Reescanear</button>
+        <button id="forget" class="link-btn" type="button" title="Esquecer o registro de aulas ja baixadas">
+          Esquecer baixadas
+        </button>
+      </div>
+      <button id="download-selected" class="btn btn-primary" type="button" disabled>
+        Baixar
+      </button>
+    </footer>
+
+    <!-- ---------- templates ---------- -->
+
+    <template id="tpl-item">
+      <article class="item">
+        <div class="item-head">
+          <span class="name"></span>
+          <span class="badges"></span>
+        </div>
+        <p class="url"></p>
+        <p class="quality"></p>
+        <div class="item-foot">
+          <button class="btn btn-quiet btn-copy" type="button">Copiar URL</button>
+          <button class="btn btn-primary btn-download" type="button">Baixar aula</button>
+        </div>
+      </article>
+    </template>
+
+    <template id="tpl-module">
+      <section class="module">
+        <div class="module-head">
+          <input type="checkbox" class="module-check" aria-label="Selecionar modulo" />
+          <button class="module-toggle" type="button" aria-expanded="false">
+            <span class="chevron" aria-hidden="true"></span>
+            <span class="module-title"></span>
+          </button>
+          <span class="module-count"></span>
+        </div>
+        <div class="module-lessons" hidden></div>
+      </section>
+    </template>
+
+    <template id="tpl-lesson">
+      <label class="lesson">
+        <input type="checkbox" class="lesson-check" />
+        <span class="lesson-title"></span>
+        <span class="lesson-state"></span>
+      </label>
+    </template>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
