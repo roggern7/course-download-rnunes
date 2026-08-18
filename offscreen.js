@@ -98,12 +98,30 @@ async function fetchAllInOrder(urls, signal, onTick) {
 
 /* ------------------------------------------------------------------ */
 
-async function runJob({ jobId, url, baseName }) {
+async function runJob({ jobId, url, format = 'hls', baseName }) {
   const controller = new AbortController();
   active = { id: jobId, controller };
   const { signal } = controller;
 
   try {
+    if (format === 'file') {
+      report(jobId, { phase: 'Baixando o arquivo de video...', container: 'mp4' });
+      const blob = await fetchWithRetry(url, signal);
+      if (signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+
+      const objectUrl = URL.createObjectURL(blob);
+      liveUrls.set(jobId, objectUrl);
+      send({
+        type: 'job-blob',
+        jobId,
+        objectUrl,
+        filename: `Course Downloader RNUNES/${baseName}.mp4`,
+        container: 'mp4',
+        size: blob.size
+      });
+      return;
+    }
+
     report(jobId, { phase: 'Lendo a playlist…' });
 
     const firstText = await fetchWithRetry(url, signal, true);

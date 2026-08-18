@@ -28,7 +28,7 @@
  * contorna login: uma secao bloqueada continua bloqueada.
  */
 
-(() => {
+(async () => {
   const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
 
   /* Textos que quase nunca sao aula. */
@@ -95,6 +95,19 @@
   function prefixesFor(pathname) {
     const segments = pathname.split('/').filter(Boolean);
     const out = [];
+
+    // Area de membros da Eduzz/AlpaClass:
+    //   /trilhas/<slug-do-curso>/aulas/<uuid-da-aula>
+    // A raiz que identifica o curso e a pasta `aulas`, nao `/trilhas/`. Sem
+    // este caso especial a busca da "raiz" mistura cursos diferentes ou tenta
+    // abrir `/trilhas/<curso>/aulas`, que nao e uma pagina de indice.
+    if (
+      segments.length >= 3 &&
+      segments[0].toLowerCase() === 'trilhas' &&
+      segments[2].toLowerCase() === 'aulas'
+    ) {
+      out.push(`/${segments.slice(0, 3).join('/')}/`);
+    }
 
     // Estando dentro de um modulo (/curso/sections/<id>), o prefixo do curso e
     // tudo ANTES do segmento container - senao as secoes irmas viram "aulas".
@@ -273,12 +286,12 @@
   }
 
   /* ---------------------------------------------------------------- *
-   * Leitura sincrona
+   * Leitura das paginas auxiliares
    *
-   * De proposito: o valor devolvido por um script injetado com `files`
-   * precisa ser um objeto simples. Uma Promise dependeria de o Chrome
-   * aguarda-la, o que deixaria a varredura refem de um detalhe de
-   * plataforma. E uma acao pontual, disparada pelo usuario.
+   * O XHR permanece sincrono porque cada documento precisa ser analisado na
+   * ordem. A funcao externa e async apenas para aguardar a renderizacao dos
+   * acordeoes; chrome.scripting.executeScript resolve a Promise antes de
+   * devolver `injection.result`.
    * ---------------------------------------------------------------- */
 
   function getSync(url) {
@@ -299,6 +312,77 @@
     } catch {
       return null;
     }
+  }
+
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * Algumas areas Eduzz so montam as aulas de um modulo depois que o acordeao
+   * e aberto. Aciona apenas controles recolhidos dentro da navegacao lateral;
+   * nunca clica em uma aula nem em botoes do conteudo principal.
+   */
+  async function expandCourseNavigation() {
+    const scopes = [
+      ...document.querySelectorAll(
+        'aside, nav, [class*="sidebar" i], [class*="side-bar" i], [class*="course-menu" i], [class*="lesson-menu" i]'
+      )
+    ];
+
+    let scope = scopes.find((el) => /navegue\s+pelas\s+aulas/i.test(textOf(el)));
+    if (!scope) {
+      scope = scopes
+        .map((el) => ({ el, count: el.querySelectorAll('[aria-expanded], [data-state]').length }))
+        .sort((a, b) => b.count - a.count)[0]?.el;
+    }
+    if (!scope) return { count: 0, modules: [] };
+
+    const discovered = [];
+    const moduleTitle = (control) => {
+      const child = control.querySelector(
+        'h2, h3, h4, [class*="module-title" i], [class*="modulo-title" i], [class*="title" i]'
+      );
+      const raw = textOf(child || control)
+        .replace(/\b\d{1,3}%\s*(conclu[ií]do)?\b.*$/i, '')
+        .replace(/\b\d+\s*aulas?\b.*$/i, '');
+      return tidyTitle(raw) || 'Aulas';
+    };
+    const capture = (control) => {
+      const snapshot = read(document, location.href);
+      if (!snapshot.lessons.length) return;
+      discovered.push({
+        title: moduleTitle(control),
+        lessons: snapshot.lessons.map((lesson) => ({ title: lesson.title, url: lesson.url }))
+      });
+    };
+    const isModuleControl = (el) => {
+      if (urlAttr(el) || el.closest('a[href]')) return false;
+      const text = textOf(el);
+      if (text.length < 2 || text.length > 180 || SKIP_LINK.test(text)) return false;
+      return el.matches('button, [role="button"], summary, [aria-controls]');
+    };
+
+    // Registra primeiro o modulo que ja estava aberto quando o usuario abriu
+    // o popup. Em acordeoes de abertura unica ele sera desmontado em seguida.
+    for (const open of scope.querySelectorAll('[aria-expanded="true"], [data-state="open"]')) {
+      if (isModuleControl(open)) capture(open);
+    }
+
+    const controls = [...scope.querySelectorAll(
+      '[aria-expanded="false"], button[data-state="closed"], [role="button"][data-state="closed"]'
+    )].filter(isModuleControl);
+
+    for (const control of controls.slice(0, MAX_MODULES)) {
+      try {
+        control.click();
+        // React/Radix normalmente materializa o painel no proximo frame.
+        await wait(35);
+        capture(control);
+      } catch {
+        /* controle desmontado por outro acordeao */
+      }
+    }
+    if (controls.length) await wait(180);
+    return { count: controls.length, modules: dedupeModules(discovered) };
   }
 
   /* ---------------------------------------------------------------- *
@@ -369,9 +453,14 @@
    */
   const LOCAL_IS_ENOUGH = 5;
 
+  const expandedNavigation = await expandCourseNavigation();
+
   const localRead = read(document, location.href);
+  const groupedLocal = groupModules(document, localRead.lessons);
+  const expandedCount = expandedNavigation.modules.reduce((sum, mod) => sum + mod.lessons.length, 0);
+  const groupedCount = groupedLocal.reduce((sum, mod) => sum + mod.lessons.length, 0);
   const local = {
-    modules: groupModules(document, localRead.lessons),
+    modules: expandedCount > groupedCount ? expandedNavigation.modules : groupedLocal,
     courseTitle: courseTitleFrom(document, location.href, localRead.prefix),
     prefix: localRead.prefix
   };

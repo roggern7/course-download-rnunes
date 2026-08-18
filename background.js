@@ -32,6 +32,7 @@ const OBSERVED_TYPES = [
 
 // Cobre: /video.m3u8, /video.m3u8?token=..., ?url=algo.m3u8&..., /hls/m3u8/, ?format=m3u8
 const M3U8_RE = /\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i;
+const MP4_RE = /\.mp4(?![a-z0-9])|[?&]format=mp4(?![a-z0-9])/i;
 
 /** @type {Map<number, Array<object>> | null} */
 let tabStreams = null;
@@ -148,7 +149,7 @@ function clearTab(tabId, { keepEntry = false } = {}) {
   updateBadge(tabId);
 }
 
-async function addStream(tabId, url, type) {
+async function addStream(tabId, url, type, formatHint = null) {
   await ensureLoaded();
 
   const list = tabStreams.get(tabId) || [];
@@ -156,11 +157,13 @@ async function addStream(tabId, url, type) {
   if (list.length >= MAX_PER_TAB) return;
 
   const resolution = detectResolution(url);
+  const format = formatHint || (M3U8_RE.test(url) ? 'hls' : 'file');
   list.push({
     url,
     name: shortName(url),
     host: hostOf(url),
     type,
+    format,
     master: looksLikeMaster(url),
     resolution: resolution ? resolution.label : null,
     height: resolution ? resolution.height : null,
@@ -186,10 +189,27 @@ chrome.webRequest.onBeforeRequest.addListener(
       return;
     }
 
-    if (!M3U8_RE.test(url)) return;
-    addStream(tabId, url, type);
+    if (!M3U8_RE.test(url) && !MP4_RE.test(url)) return;
+    addStream(tabId, url, type, M3U8_RE.test(url) ? 'hls' : 'file');
   },
   { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES }
+);
+
+// Alguns players usam uma URL assinada sem extensao. Nesse caso o cabecalho
+// Content-Type e a unica forma confiavel de reconhecer a playlist/arquivo.
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    const { tabId, url, type, responseHeaders = [] } = details;
+    if (tabId < 0 || type === 'main_frame') return;
+    const contentType = responseHeaders.find((header) => header.name.toLowerCase() === 'content-type');
+    const value = (contentType && contentType.value) || '';
+    const isHls = /(mpegurl|vnd\.apple\.mpegurl)/i.test(value);
+    const isMp4 = /video\/mp4/i.test(value) && !/\.googlevideo\.com$/i.test(hostOf(url));
+    if (!isHls && !isMp4) return;
+    addStream(tabId, url, type, isHls ? 'hls' : 'file');
+  },
+  { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES },
+  ['responseHeaders']
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -364,7 +384,7 @@ function newJob(fields) {
  * Inicia o download da aula.
  * @param {{ tabId: number, url: string }} params
  */
-async function startDownload({ tabId, url, baseName: explicitName }) {
+async function startDownload({ tabId, url, format = 'hls', baseName: explicitName }) {
   if (job && job.status === 'running') {
     return { ok: false, error: 'Ja existe um download em andamento.' };
   }
@@ -388,6 +408,7 @@ async function startDownload({ tabId, url, baseName: explicitName }) {
     type: 'run-job',
     jobId: job.id,
     url,
+    format,
     baseName
   }).catch((error) => {
     job.status = 'error';
@@ -628,13 +649,36 @@ async function scanCourse(tabId) {
       files: ['scan-course.js']
     });
     const result = injection && injection.result;
-    if (!result || !result.ok) {
-      return {
-        ok: false,
-        error: (result && result.reason) || 'nao foi possivel ler a navegacao desta pagina'
-      };
+
+    // SPAs da Eduzz podem navegar por botoes, sem href no DOM isolado. Nesse
+    // caso le somente os dados React que a pagina ja recebeu (MAIN world). A
+    // comparacao tambem evita aceitar apenas o primeiro modulo visivel.
+    let dataResult = null;
+    const isEduzzTrail = result && /^\/trilhas\/[^/]+\/aulas\//i.test(result.prefix || '');
+    if (!result || !result.ok || isEduzzTrail) {
+      const [dataInjection] = await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['scan-page-data.js'],
+        world: 'MAIN'
+      });
+      dataResult = dataInjection && dataInjection.result;
     }
-    return { ok: true, course: result };
+    if (
+      dataResult &&
+      dataResult.ok &&
+      (!result || !result.ok || dataResult.lessonCount > result.lessonCount)
+    ) {
+      return { ok: true, course: dataResult };
+    }
+    if (result && result.ok) return { ok: true, course: result };
+
+    return {
+      ok: false,
+      error:
+        (dataResult && dataResult.reason) ||
+        (result && result.reason) ||
+        'nao foi possivel ler a navegacao desta pagina'
+    };
   } catch (error) {
     return { ok: false, error: error.message };
   }
@@ -860,11 +904,17 @@ async function waitForTabLoad(tabId, timeoutMs = PAGE_TIMEOUT_MS) {
  */
 async function nudgePlay(tabId) {
   try {
-    await chrome.scripting.executeScript({
+    const frames = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       func: () => {
+        const urls = new Set();
+        let videoCount = 0;
         for (const video of document.querySelectorAll('video')) {
           try {
+            videoCount++;
+            if (video.currentSrc) urls.add(video.currentSrc);
+            if (video.src) urls.add(video.src);
+            for (const source of video.querySelectorAll('source[src]')) urls.add(source.src);
             video.muted = true;
             const played = video.play();
             if (played && played.catch) played.catch(() => {});
@@ -872,8 +922,35 @@ async function nudgePlay(tabId) {
             /* autoplay bloqueado */
           }
         }
+
+        // Players que so criam o <video> depois do primeiro gesto.
+        if (!videoCount) {
+          const play = document.querySelector(
+            '.vjs-big-play-button, .plyr__control--overlaid, .ytp-large-play-button, button[aria-label*="play" i], button[title*="play" i], button[aria-label*="reprodu" i]'
+          );
+          if (play) {
+            try { play.click(); } catch { /* controle protegido */ }
+          }
+        }
+
+        try {
+          for (const entry of performance.getEntriesByType('resource')) {
+            if (/\.m3u8(?![a-z0-9])|\.mp4(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(entry.name)) {
+              urls.add(entry.name);
+            }
+          }
+        } catch {
+          /* Performance API indisponivel */
+        }
+        return { urls: [...urls].slice(-30), videoCount };
       }
     });
+
+    for (const frame of frames) {
+      for (const url of (frame.result && frame.result.urls) || []) {
+        if (M3U8_RE.test(url) || MP4_RE.test(url)) await addStream(tabId, url, 'player');
+      }
+    }
   } catch {
     /* pagina sem permissao de injecao */
   }
@@ -886,19 +963,25 @@ async function nudgePlay(tabId) {
  * Reaproveita o cache de probeMaster.
  */
 async function pickStream(list) {
-  for (const stream of list) {
+  const hls = list.filter((stream) => stream.format !== 'file');
+  for (const stream of hls) {
     const probed = await probeMaster(stream.url);
     if (probed && !probed.error && probed.variants.length) return stream;
   }
-  return list[0];
+  return hls[0] || list.find((stream) => stream.format === 'file') || list[0];
 }
 
 /** Espera a aba revelar uma playlist, dando tempo para as variantes chegarem. */
 async function waitForStream(tabId, timeoutMs = STREAM_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   let firstSeenAt = null;
+  let lastNudge = 0;
 
   while (Date.now() < deadline) {
+    if (Date.now() - lastNudge >= 1000) {
+      lastNudge = Date.now();
+      await nudgePlay(tabId);
+    }
     await ensureLoaded();
     const list = tabStreams.get(tabId) || [];
 
@@ -978,6 +1061,7 @@ async function runBatchItem(item) {
   const started = await startDownload({
     tabId: batch.tabId,
     url: stream.url,
+    format: stream.format,
     baseName: item.path
   });
   if (!started.ok) {
@@ -1137,14 +1221,14 @@ async function retryFailed() {
 
   let primeiro = -1;
   batch.items.forEach((item, index) => {
-    if (item.status !== 'error') return;
+    if (item.status !== 'error' && item.status !== 'skipped') return;
     item.status = 'pending';
     item.error = null;
     item.phase = null;
     if (primeiro < 0) primeiro = index;
   });
 
-  if (primeiro < 0) return { ok: false, error: 'Nenhuma aula com erro.' };
+  if (primeiro < 0) return { ok: false, error: 'Nenhuma aula para tentar novamente.' };
 
   batch.cursor = primeiro;
   batch.status = 'running';
@@ -1273,7 +1357,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (type === 'start-download') {
-    startDownload({ tabId: message.tabId, url: message.url }).then(sendResponse);
+    startDownload({ tabId: message.tabId, url: message.url, format: message.format }).then(sendResponse);
     return true;
   }
 

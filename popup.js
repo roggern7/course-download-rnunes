@@ -206,8 +206,9 @@ function renderFila(batch, job) {
   setFile(null);
   batchPauseEl.hidden = terminada;
   batchPauseEl.textContent = pausada ? 'Continuar' : 'Pausar';
-  batchRetryEl.hidden = !(terminada && c.error);
-  batchRetryEl.textContent = `Tentar novamente (${c.error})`;
+  const repetiveis = c.error + c.skipped;
+  batchRetryEl.hidden = !(terminada && repetiveis);
+  batchRetryEl.textContent = `Tentar novamente (${repetiveis})`;
   activityCloseEl.textContent = terminada ? 'Fechar' : 'Cancelar';
 }
 
@@ -328,8 +329,10 @@ function buildItem(stream, { downloadable }) {
     badges.appendChild(tag);
   }
 
-  node.querySelector('.quality').textContent = `${stream.host} · ${qualityText(stream.url)}`;
-  probe(stream.url);
+  node.querySelector('.quality').textContent = stream.format === 'file'
+    ? `${stream.host} · arquivo MP4`
+    : `${stream.host} · ${qualityText(stream.url)}`;
+  if (stream.format !== 'file') probe(stream.url);
 
   const copyBtn = node.querySelector('.btn-copy');
   copyBtn.addEventListener('click', () => copyUrl(stream.url, copyBtn));
@@ -338,7 +341,7 @@ function buildItem(stream, { downloadable }) {
   downloadBtn.disabled = !downloadable || busy();
   if (!downloadable) downloadBtn.title = 'Abra a aba correspondente para baixar esta aula.';
   else if (busy()) downloadBtn.title = 'Ja existe um download em andamento.';
-  downloadBtn.addEventListener('click', () => startDownload(stream.url));
+  downloadBtn.addEventListener('click', () => startDownload(stream));
 
   return node;
 }
@@ -364,9 +367,14 @@ async function copyUrl(url, button) {
   }, 1300);
 }
 
-async function startDownload(url) {
+async function startDownload(stream) {
   if (!currentTab) return;
-  const response = await send({ type: 'start-download', tabId: currentTab.id, url });
+  const response = await send({
+    type: 'start-download',
+    tabId: currentTab.id,
+    url: stream.url,
+    format: stream.format || 'hls'
+  });
   if (response && response.ok === false) {
     activityEl.hidden = false;
     setNote(response.error, 'error');
