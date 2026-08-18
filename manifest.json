@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Course Downloader RNUNES",
-  "version": "3.2.1",
+  "version": "3.2.6",
   "description": "Detecta as aulas de um curso, identifica a melhor qualidade e baixa em lote organizando por Curso/Modulo/Aula.",
   "minimum_chrome_version": "116",
   "permissions": [

@@ -160,6 +160,9 @@ function renderFila(batch, job) {
   const pausada = batch.status === 'paused';
   const terminada = !rodando && !pausada;
   const atual = batch.items[batch.cursor];
+  const firstFailure = batch.items.find((item) =>
+    (item.status === 'error' || item.status === 'skipped') && item.error
+  );
 
   if (rodando && atual) {
     activityTitleEl.textContent = `Aula ${batch.cursor + 1} de ${c.total}`;
@@ -197,8 +200,12 @@ function renderFila(batch, job) {
 
   if (terminada) {
     const total = `${plural(c.total, 'aula', 'aulas')}: ${resumoFila(c)}.`;
-    if (c.error) setNote(`${total} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
-    else setNote(total, 'ok');
+    if (c.error || c.skipped) {
+      const detail = firstFailure ? ` Primeira falha: ${firstFailure.error}.` : '';
+      setNote(`${total}${detail} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
+    } else setNote(total, 'ok');
+  } else if (pausada && firstFailure) {
+    setNote(`Primeira falha: ${firstFailure.error}.`, 'warn');
   } else {
     setNote('', null);
   }

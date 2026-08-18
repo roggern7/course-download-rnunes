@@ -882,13 +882,138 @@ function lessonPath(courseTitle, item) {
   ].join('/');
 }
 
-async function waitForTabLoad(tabId, timeoutMs = PAGE_TIMEOUT_MS) {
+/**
+ * Navega como o proprio menu do curso. Nessa area de membros o player e
+ * criado corretamente pela rota interna do React; recarregar a URL inteira
+ * pode reconstruir apenas a pagina textual e nunca inicializar o video.
+ */
+async function navigateToLesson(tabId, lessonUrl, lessonTitle) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      args: [lessonUrl, lessonTitle],
+      func: async (targetUrl, targetTitle) => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const target = new URL(targetUrl, location.href);
+        if (location.origin === target.origin &&
+            location.pathname.replace(/\/$/, '') === target.pathname.replace(/\/$/, '')) {
+          return { ok: true, method: 'current' };
+        }
+
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const urlAttrs = ['href', 'data-href', 'data-url', 'data-link', 'data-to', 'data-path'];
+        const sameTarget = (raw) => {
+          if (!raw) return false;
+          try {
+            const url = new URL(raw, location.href);
+            return url.origin === target.origin &&
+              url.pathname.replace(/\/$/, '') === target.pathname.replace(/\/$/, '');
+          } catch {
+            return false;
+          }
+        };
+        const clickable = (el) => {
+          if (!el) return null;
+          const semantic = el.closest('a, button, [role="button"]');
+          if (semantic) return semantic;
+          // Alguns menus React usam <div> clicavel sem role/onclick no HTML.
+          for (let node = el; node && node !== document.documentElement; node = node.parentElement) {
+            let names = [];
+            try { names = Object.getOwnPropertyNames(node); } catch { continue; }
+            for (const name of names) {
+              if (!name.startsWith('__reactProps$')) continue;
+              try {
+                if (typeof node[name]?.onClick === 'function') return node;
+              } catch {
+                /* props inacessiveis */
+              }
+            }
+          }
+          return null;
+        };
+        const menuScopes = [...document.querySelectorAll(
+          'aside, nav, [class*="sidebar" i], [class*="side-bar" i], [class*="course-menu" i], [class*="lesson-menu" i]'
+        )];
+        const scope = menuScopes.find((el) =>
+          /navegue\s+pelas\s+aulas/i.test(el.innerText || el.textContent)
+        ) || menuScopes[0] || document;
+        const findTarget = () => {
+          for (const el of document.querySelectorAll(
+            'a[href], [data-href], [data-url], [data-link], [data-to], [data-path]'
+          )) {
+            if (urlAttrs.some((attr) => sameTarget(el.getAttribute(attr)))) {
+              const targetControl = clickable(el);
+              if (targetControl) return targetControl;
+            }
+          }
+
+          // Quando a URL existe apenas no estado do React, localiza o texto
+          // folha da aula e sobe ate o botao/link real. Nao procura o UUID nas
+          // props do contêiner: ele contem o curso inteiro e causava clique no
+          // elemento errado, embora a rotina informasse sucesso.
+          const wanted = clean(targetTitle);
+          if (wanted) {
+            for (const el of scope.querySelectorAll('*')) {
+              if (el.children.length && !el.matches('a, button, [role="button"]')) continue;
+              const text = clean(el.innerText || el.textContent);
+              if (text !== wanted && !text.startsWith(`${wanted} `)) continue;
+              const targetControl = clickable(el);
+              if (targetControl) return targetControl;
+            }
+          }
+          return null;
+        };
+
+        let link = findTarget();
+        if (link) {
+          link.click();
+          return { ok: true, method: 'menu' };
+        }
+
+        // Aulas de modulos fechados podem nem existir no DOM. Abre cada
+        // acordeao e procura novamente antes de passar ao proximo.
+        const controls = [...scope.querySelectorAll(
+          '[aria-expanded="false"], button[data-state="closed"], [role="button"][data-state="closed"]'
+        )];
+        for (const control of controls.slice(0, 100)) {
+          try { control.click(); } catch { continue; }
+          await wait(60);
+          link = findTarget();
+          if (link) {
+            link.click();
+            return { ok: true, method: 'menu-expanded' };
+          }
+        }
+        return { ok: false, method: 'not-found' };
+      }
+    });
+    return (injection && injection.result) || { ok: false, method: 'no-result' };
+  } catch (error) {
+    return { ok: false, method: 'script-error', error: error.message };
+  }
+}
+
+async function waitForTabLoad(tabId, expectedUrl, timeoutMs = PAGE_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
-  await delay(400); // deixa a navegacao comecar antes de ler o status
+  await delay(250); // deixa a navegacao comecar antes de ler o status
+  const expected = (() => {
+    try { return new URL(expectedUrl); } catch { return null; }
+  })();
   while (Date.now() < deadline) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete') return true;
+      let correctPage = true;
+      if (expected) {
+        const current = new URL(tab.url || 'about:blank');
+        correctPage = current.origin === expected.origin &&
+          current.pathname.replace(/\/$/, '') === expected.pathname.replace(/\/$/, '');
+      }
+      if (correctPage && tab.status === 'complete') {
+        // `complete` antecede a hidratacao do React e a criacao do iframe.
+        await delay(900);
+        return true;
+      }
     } catch {
       return false; // aba fechada
     }
@@ -902,20 +1027,33 @@ async function waitForTabLoad(tabId, timeoutMs = PAGE_TIMEOUT_MS) {
  * play() no elemento de video ja presente na pagina - nao contorna login,
  * paywall nem protecao.
  */
-async function nudgePlay(tabId) {
+async function nudgePlay(tabId, { deep = false } = {}) {
   try {
     const frames = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
-      func: () => {
+      world: 'MAIN',
+      args: [deep],
+      func: (deepScan) => {
         const urls = new Set();
+        const hinted = [];
         let videoCount = 0;
-        for (const video of document.querySelectorAll('video')) {
+        const roots = [document];
+        for (let index = 0; index < roots.length; index++) {
+          for (const el of roots[index].querySelectorAll('*')) {
+            if (el.shadowRoot) roots.push(el.shadowRoot);
+          }
+        }
+        const queryAll = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
+
+        for (const video of queryAll('video')) {
           try {
             videoCount++;
             if (video.currentSrc) urls.add(video.currentSrc);
             if (video.src) urls.add(video.src);
             for (const source of video.querySelectorAll('source[src]')) urls.add(source.src);
             video.muted = true;
+            video.autoplay = true;
+            if (!video.currentSrc && (video.src || video.querySelector('source[src]'))) video.load();
             const played = video.play();
             if (played && played.catch) played.catch(() => {});
           } catch {
@@ -925,9 +1063,9 @@ async function nudgePlay(tabId) {
 
         // Players que so criam o <video> depois do primeiro gesto.
         if (!videoCount) {
-          const play = document.querySelector(
+          const play = queryAll(
             '.vjs-big-play-button, .plyr__control--overlaid, .ytp-large-play-button, button[aria-label*="play" i], button[title*="play" i], button[aria-label*="reprodu" i]'
-          );
+          )[0];
           if (play) {
             try { play.click(); } catch { /* controle protegido */ }
           }
@@ -942,17 +1080,110 @@ async function nudgePlay(tabId) {
         } catch {
           /* Performance API indisponivel */
         }
-        return { urls: [...urls].slice(-30), videoCount };
+
+        // Antes do play, varias bibliotecas guardam a playlist apenas nas
+        // props React/JSON do player. Isso e essencial para a fila automatica,
+        // que nao recebe um clique humano em cada aula.
+        if (deepScan) {
+          const dataRoots = [];
+          if (window.__NEXT_DATA__ && typeof window.__NEXT_DATA__ === 'object') dataRoots.push(window.__NEXT_DATA__);
+          for (const script of document.querySelectorAll('script[type="application/json"]')) {
+            try { dataRoots.push(JSON.parse(script.textContent)); } catch { /* nao era JSON completo */ }
+          }
+
+          // Next/React tambem serializa dados em scripts JavaScript comuns.
+          // Extrai apenas URLs de midia, sem executar ou armazenar o restante.
+          for (const script of document.scripts) {
+            const text = (script.textContent || '').replace(/\\u0026/gi, '&').replace(/\\\//g, '/');
+            const matches = text.match(/https?:[^\s"'<>\\]+/gi) || [];
+            for (const raw of matches.slice(0, 200)) {
+              const url = raw.replace(/[),;\]}]+$/, '');
+              if (/\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(url)) {
+                hinted.push({ url, format: 'hls' });
+              } else if (/\.mp4(?![a-z0-9])|[?&]format=mp4/i.test(url)) {
+                hinted.push({ url, format: 'file' });
+              }
+            }
+          }
+          for (const el of document.querySelectorAll('*')) {
+            let names = [];
+            try { names = Object.getOwnPropertyNames(el); } catch { continue; }
+            for (const name of names) {
+              if (name.startsWith('__reactProps$')) dataRoots.push(el[name]);
+              if (!name.startsWith('__reactFiber$')) continue;
+              let fiber = el[name];
+              for (let level = 0; fiber && level < 8; level++, fiber = fiber.return) {
+                if (fiber.memoizedProps) dataRoots.push(fiber.memoizedProps);
+              }
+            }
+          }
+
+          const seen = new WeakSet();
+          const queue = dataRoots.map((value) => ({ value, context: '' }));
+          let cursor = 0;
+          let visited = 0;
+          while (cursor < queue.length && visited < 18000 && hinted.length < 40) {
+            const { value, context } = queue[cursor++];
+            if (!value || typeof value !== 'object' || seen.has(value)) continue;
+            if (typeof Node === 'function' && value instanceof Node) continue;
+            seen.add(value);
+            visited++;
+            let entries = [];
+            try { entries = Object.entries(value); } catch { continue; }
+            for (const [key, child] of entries) {
+              const nextContext = `${context}.${key}`.slice(-160);
+              if (typeof child === 'string') {
+                const raw = child.replace(/\\u0026/gi, '&').replace(/\\\//g, '/');
+                if (/^https?:/i.test(raw)) {
+                  if (/\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(raw)) {
+                    hinted.push({ url: raw, format: 'hls' });
+                  } else if (/\.mp4(?![a-z0-9])|[?&]format=mp4/i.test(raw)) {
+                    hinted.push({ url: raw, format: 'file' });
+                  } else if (/(hls|m3u8|manifest|playlist)/i.test(nextContext)) {
+                    hinted.push({ url: raw, format: 'hls' });
+                  }
+                }
+              } else if (child && typeof child === 'object' &&
+                         !/^(_owner|return|stateNode|child|sibling|alternate)$/i.test(key)) {
+                queue.push({ value: child, context: nextContext });
+              }
+            }
+          }
+        }
+        const iframeHosts = queryAll('iframe[src]').map((iframe) => {
+          try { return new URL(iframe.src).hostname; } catch { return 'iframe'; }
+        });
+        return {
+          documentUrl: location.href,
+          urls: [...urls].slice(-30),
+          hinted,
+          videoCount,
+          iframeCount: iframeHosts.length,
+          iframeHosts: [...new Set(iframeHosts)].slice(0, 5),
+          shadowRoots: Math.max(0, roots.length - 1)
+        };
       }
     });
 
+    const diagnostics = [];
     for (const frame of frames) {
+      if (frame.result) diagnostics.push(frame.result);
       for (const url of (frame.result && frame.result.urls) || []) {
         if (M3U8_RE.test(url) || MP4_RE.test(url)) await addStream(tabId, url, 'player');
       }
+      for (const source of (frame.result && frame.result.hinted) || []) {
+        try {
+          const url = new URL(source.url, frame.result.documentUrl || undefined).href;
+          await addStream(tabId, url, 'player-config', source.format);
+        } catch {
+          /* URL de configuracao invalida */
+        }
+      }
     }
+    return diagnostics;
   } catch {
     /* pagina sem permissao de injecao */
+    return [];
   }
 }
 
@@ -976,24 +1207,30 @@ async function waitForStream(tabId, timeoutMs = STREAM_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   let firstSeenAt = null;
   let lastNudge = 0;
+  let lastDeepScan = 0;
+  let diagnostics = [];
 
   while (Date.now() < deadline) {
     if (Date.now() - lastNudge >= 1000) {
       lastNudge = Date.now();
-      await nudgePlay(tabId);
+      const deep = Date.now() - lastDeepScan >= 5000;
+      if (deep) lastDeepScan = Date.now();
+      diagnostics = await nudgePlay(tabId, { deep });
     }
     await ensureLoaded();
     const list = tabStreams.get(tabId) || [];
 
     if (list.length) {
       if (!firstSeenAt) firstSeenAt = Date.now();
-      if (Date.now() - firstSeenAt > 1200) return pickStream(list);
+      if (Date.now() - firstSeenAt > 1200) {
+        return { stream: await pickStream(list), diagnostics };
+      }
     }
 
     await delay(300);
   }
 
-  return null;
+  return { stream: null, diagnostics };
 }
 
 async function waitForJob(jobId, timeoutMs = 45 * 60 * 1000) {
@@ -1028,29 +1265,68 @@ async function runBatchItem(item) {
     }
   }
 
-  try {
-    await chrome.tabs.update(batch.tabId, { url: item.url });
-  } catch (error) {
-    item.status = 'error';
-    item.error = `nao foi possivel abrir a aba (${error.message})`;
-    return;
-  }
+  // Nunca deixa a playlist da aula anterior satisfazer a proxima iteracao.
+  await ensureLoaded();
+  clearTab(batch.tabId, { keepEntry: true });
 
-  if (!(await waitForTabLoad(batch.tabId))) {
+  const navigation = await navigateToLesson(batch.tabId, item.url, item.title);
+  if (!navigation.ok) {
+    try {
+      await chrome.tabs.update(batch.tabId, { url: item.url });
+      navigation.method = 'recarregamento';
+    } catch (error) {
+      item.status = 'error';
+      item.error = `nao foi possivel abrir a aba (${error.message})`;
+      return;
+    }
+  }
+  item.navigation = navigation.method;
+
+  let loaded = await waitForTabLoad(batch.tabId, item.url);
+  if (!loaded && navigation.ok && navigation.method !== 'current') {
+    try {
+      await chrome.tabs.update(batch.tabId, { url: item.url });
+      navigation.method += '+recarregamento';
+      item.navigation = navigation.method;
+      loaded = await waitForTabLoad(batch.tabId, item.url);
+    } catch {
+      /* a mensagem detalhada e montada abaixo */
+    }
+  }
+  if (!loaded) {
     item.status = 'error';
-    item.error = 'a pagina nao terminou de carregar';
+    try {
+      const actual = (await chrome.tabs.get(batch.tabId)).url || '';
+      item.error = actual && actual !== item.url
+        ? `a aula redirecionou para outra pagina (${actual})`
+        : 'a pagina nao terminou de carregar';
+    } catch {
+      item.error = 'a pagina nao terminou de carregar';
+    }
     return;
   }
   if (batchCanceled()) return;
 
   item.phase = 'Procurando o video…';
   saveBatch();
-  await nudgePlay(batch.tabId);
+  await nudgePlay(batch.tabId, { deep: true });
 
-  const stream = await waitForStream(batch.tabId);
+  const detection = await waitForStream(batch.tabId);
+  const stream = detection.stream;
   if (!stream) {
     item.status = 'skipped';
-    item.error = 'sem video nesta aula';
+    const diagnostics = detection.diagnostics || [];
+    const videos = diagnostics.reduce((sum, frame) => sum + (frame.videoCount || 0), 0);
+    const iframes = diagnostics.reduce((sum, frame) => sum + (frame.iframeCount || 0), 0);
+    const hosts = [...new Set(diagnostics.flatMap((frame) => frame.iframeHosts || []))];
+    item.error = [
+      'sem URL de video detectada',
+      `${diagnostics.length} frame(s) inspecionado(s)`,
+      `${videos} video(s)`,
+      `${iframes} iframe(s)`,
+      hosts.length ? `player: ${hosts.join(', ')}` : null,
+      `navegacao: ${item.navigation || 'desconhecida'}`
+    ].filter(Boolean).join(' · ');
     return;
   }
   if (batchCanceled()) return;
