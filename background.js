@@ -650,12 +650,18 @@ async function scanCourse(tabId) {
     });
     const result = injection && injection.result;
 
-    // SPAs da Eduzz podem navegar por botoes, sem href no DOM isolado. Nesse
-    // caso le somente os dados React que a pagina ja recebeu (MAIN world). A
-    // comparacao tambem evita aceitar apenas o primeiro modulo visivel.
+    // SPAs da Eduzz e Hotmart podem navegar por botoes, sem href no DOM
+    // isolado. Nesse caso le somente os dados React que a pagina ja recebeu
+    // (MAIN world). A comparacao tambem evita aceitar apenas o primeiro modulo
+    // visivel.
     let dataResult = null;
     const isEduzzTrail = result && /^\/trilhas\/[^/]+\/aulas\//i.test(result.prefix || '');
-    if (!result || !result.ok || isEduzzTrail) {
+    const isHotmartContent =
+      result &&
+      /\/club\/[^/]+\/products\/[^/]+\/content\//i.test(
+        (result.currentUrl || '') + (result.prefix || '')
+      );
+    if (!result || !result.ok || isEduzzTrail || isHotmartContent) {
       const [dataInjection] = await chrome.scripting.executeScript({
         target: { tabId },
         files: ['scan-page-data.js'],

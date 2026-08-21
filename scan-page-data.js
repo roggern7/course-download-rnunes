@@ -1,5 +1,5 @@
 /**
- * Fallback para areas de membros SPA (Eduzz/AlpaClass).
+ * Fallback para areas de membros SPA (Eduzz/AlpaClass e Hotmart Club).
  *
  * Algumas delas desenham aulas como <button> e guardam id/titulo somente nos
  * dados do React. Este arquivo roda no MAIN world exclusivamente para ler essa
@@ -8,14 +8,49 @@
  */
 (async () => {
   const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-  const match = location.pathname.match(/^(\/trilhas\/[^/]+\/aulas\/)([^/?#]+)/i);
-  if (!match) return { ok: false, reason: 'a pagina nao usa uma rota de aula reconhecida.' };
-
-  const prefix = match[1];
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const hotmartHash = /^[a-z0-9_-]{6,128}$/i;
+
+  function routeFrom(pathname) {
+    const eduzz = pathname.match(/^(\/trilhas\/([^/]+)\/aulas\/)([^/?#]+)/i);
+    if (eduzz) {
+      return {
+        platform: 'eduzz',
+        prefix: eduzz[1],
+        courseSlug: eduzz[2],
+        currentLessonId: eduzz[3],
+        acceptsId: (value) => uuid.test(value)
+      };
+    }
+
+    // Hotmart Club atual:
+    // /pt-BR/club/<area>/products/<produto>/content/<hash-da-aula>
+    // O locale e opcional porque links internos podem omiti-lo.
+    const hotmart = pathname.match(
+      /^(\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?club\/([^/]+)\/products\/([^/]+)\/content\/)([^/?#]+)/i
+    );
+    if (hotmart) {
+      return {
+        platform: 'hotmart',
+        prefix: hotmart[1],
+        courseSlug: hotmart[2],
+        productId: hotmart[3],
+        currentLessonId: hotmart[4],
+        acceptsId: (value) => hotmartHash.test(value) && value !== hotmart[3]
+      };
+    }
+
+    return null;
+  }
+
+  const route = routeFrom(location.pathname);
+  if (!route) return { ok: false, reason: 'a pagina nao usa uma rota de aula reconhecida.' };
+
+  const prefix = route.prefix;
   const titleKey = /^(title|titulo|t[ií]tulo|name|nome|label)$/i;
-  const idKey = /^(id|uuid|lesson_?id|aula_?id|content_?id)$/i;
-  const lessonKey = /(aulas?|lessons?|classes?|episodes?|episodios?|epis[oó]dios?)/i;
+  const strongIdKey = /^(uuid|hash|lesson_?id|aula_?id|content_?id|page_?id)$/i;
+  const idKey = /^(id|uuid|hash|lesson_?id|aula_?id|content_?id|page_?id)$/i;
+  const lessonKey = /(aulas?|lessons?|classes?|pages|paginas|p[aá]ginas|episodes?|episodios?|epis[oó]dios?)/i;
   const contentKey = /^(contents?|conteudos?|conte[uú]dos?|items?)$/i;
   const moduleKey = /(modules?|modulos?|m[oó]dulos?|sections?|secoes?|se[cç][oõ]es?|chapters?|capitulos?)/i;
   const mediaKey = /(video|player|media|duration|dura[cç][aã]o|lesson|aula|episode|epis[oó]dio)/i;
@@ -41,12 +76,23 @@
   }
 
   function directId(obj) {
-    for (const [key, value] of ownEntries(obj)) {
-      if (!idKey.test(key)) continue;
-      const id = clean(value);
-      if (uuid.test(id)) return id;
+    const entries = ownEntries(obj);
+    // A navigation da Hotmart traz hash; prioriza identificadores de aula
+    // antes do id generico, que no mesmo objeto pode ser o id do produto.
+    for (const strongOnly of [true, false]) {
+      for (const [key, value] of entries) {
+        if (!idKey.test(key) || (strongOnly && !strongIdKey.test(key))) continue;
+        const id = clean(value);
+        if (route.acceptsId(id)) return id;
+      }
     }
     return '';
+  }
+
+  function hasStrongId(obj) {
+    return ownEntries(obj).some(([key, value]) =>
+      strongIdKey.test(key) && route.acceptsId(clean(value))
+    );
   }
 
   function directUrl(obj) {
@@ -77,7 +123,7 @@
     if (explicitUrl) return { title, url: explicitUrl };
 
     const id = directId(obj);
-    if (!id || (!assumedLesson && !hasMediaEvidence(obj))) return null;
+    if (!id || (!assumedLesson && !hasStrongId(obj) && !hasMediaEvidence(obj))) return null;
     return { title, url: new URL(prefix + id, location.origin).href };
   }
 
@@ -122,6 +168,9 @@
 
   const roots = [];
   if (window.__NEXT_DATA__ && typeof window.__NEXT_DATA__ === 'object') roots.push(window.__NEXT_DATA__);
+  for (const key of ['__INITIAL_STATE__', '__PRELOADED_STATE__', '__APOLLO_STATE__', '__NUXT__']) {
+    if (window[key] && typeof window[key] === 'object') roots.push(window[key]);
+  }
 
   for (const script of document.querySelectorAll('script[type="application/json"]')) {
     try {
@@ -145,6 +194,7 @@
       let fiber = el[name];
       for (let level = 0; fiber && level < 12; level++, fiber = fiber.return) {
         if (fiber.memoizedProps) roots.push(fiber.memoizedProps);
+        if (fiber.memoizedState) roots.push(fiber.memoizedState);
         if (fiber.pendingProps && fiber.pendingProps !== fiber.memoizedProps) roots.push(fiber.pendingProps);
       }
     }
@@ -218,7 +268,9 @@
   }
 
   const lessonCount = modules.reduce((sum, module) => sum + module.lessons.length, 0);
-  const slug = decodeURIComponent(location.pathname.split('/')[2] || 'Curso');
+  const pageTitle =
+    route.platform === 'hotmart' ? clean(document.title).split(/\s+\|\s+/)[0] : '';
+  const slug = decodeURIComponent(route.courseSlug || 'Curso');
   const courseTitle = slug
     .split('-')
     .filter(Boolean)
@@ -230,7 +282,10 @@
         ok: true,
         modules,
         lessonCount,
-        courseTitle: courseTitle || 'Curso',
+        courseTitle:
+          (pageTitle && !/^hotmart(?: club)?$/i.test(pageTitle) ? pageTitle.slice(0, 90) : '') ||
+          courseTitle ||
+          'Curso',
         prefix,
         source: 'dados da pagina',
         currentUrl: location.href
