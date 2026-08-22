@@ -21,6 +21,30 @@ import {
 
 const STORAGE_KEY = 'streams';
 const MAX_PER_TAB = 200;
+const FAKE_DATE_KEY = 'fakeDateEnabled';
+const FAKE_DATE_SCRIPT_ID = 'fake-date-main';
+const FAKE_DATE_RESCAN_KEY = 'fakeDateRescanTabs';
+const LESSON_DEBUG_SCRIPT_ID = 'lesson-debug-main';
+const LESSON_DEBUG_STORE_KEY = '__COURSE_DOWNLOADER_LESSON_DEBUG__';
+const MEDIA_RESOLVER_TEMPLATE_KEY = 'mediaResolverTemplate';
+
+const FAKE_DATE_SCRIPT = {
+  id: FAKE_DATE_SCRIPT_ID,
+  matches: ['http://*/*', 'https://*/*'],
+  js: ['fake-date.js'],
+  runAt: 'document_start',
+  world: 'MAIN',
+  persistAcrossSessions: true
+};
+
+const LESSON_DEBUG_SCRIPT = {
+  id: LESSON_DEBUG_SCRIPT_ID,
+  matches: ['http://*/*', 'https://*/*'],
+  js: ['lesson-debug.js'],
+  runAt: 'document_start',
+  world: 'MAIN',
+  persistAcrossSessions: true
+};
 
 const OBSERVED_TYPES = [
   'main_frame',
@@ -33,6 +57,17 @@ const OBSERVED_TYPES = [
 // Cobre: /video.m3u8, /video.m3u8?token=..., ?url=algo.m3u8&..., /hls/m3u8/, ?format=m3u8
 const M3U8_RE = /\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i;
 const MP4_RE = /\.mp4(?![a-z0-9])|[?&]format=mp4(?![a-z0-9])/i;
+const MPD_RE = /\.mpd(?![a-z0-9])|[?&/=]mpd(?![a-z0-9])/i;
+const PANDA_HOST_RE = /(?:^|\.)pandavideo\.com\.br$/i;
+const PANDA_FALLBACK_IDS = new Set([
+  // Player Panda: substitutos internos para 403 e sharelock/comparison invalido.
+  '48af5a59-3ac4-480e-abff-905690d94567',
+  'cd676325-3f2d-4ad5-b95c-c2a683d7b0cc',
+  // Vinheta generica "This video encountered an error".
+  'f7a741ee-5cad-4f8c-87bc-f6a008776edb'
+]);
+const INTERNAL_MEDIA_RE = /(?:^|[\/_.-])(?:error|fallback|placeholder|preview)(?:[\/_.-]|$)/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** @type {Map<number, Array<object>> | null} */
 let tabStreams = null;
@@ -47,6 +82,72 @@ let job = null;
 
 /** @type {Promise<void> | null} Evita criar dois documentos offscreen. */
 let creatingOffscreen = null;
+
+/** Instrumentacao temporaria: existe apenas em memoria e nunca altera status. */
+const lessonDebugContexts = new Map();
+const DEBUG_REQUEST_RE = /(graphql|api|video|media|playback|asset|stream|manifest|playlist|m3u8|mp4|lesson|content)/i;
+const PLAYER_FLOW_RE = /(lesson|content|media|video|player|playback|asset|stream|watch)/i;
+const PLAYER_ID_KEY_RE = /^(?:lesson|content|video|media|asset|playback)(?:_?id)?$|^id$/i;
+const DEBUG_SECRET_RE = /(authorization|cookie|token|secret|password|signature|credential|api[-_]?key)/i;
+let observedPlayerFlow = null;
+
+async function syncFakeDateScript(enabled) {
+  const registered = await chrome.scripting.getRegisteredContentScripts({
+    ids: [FAKE_DATE_SCRIPT_ID]
+  });
+  if (enabled) {
+    if (registered.length) await chrome.scripting.updateContentScripts([FAKE_DATE_SCRIPT]);
+    else await chrome.scripting.registerContentScripts([FAKE_DATE_SCRIPT]);
+  } else if (registered.length) {
+    await chrome.scripting.unregisterContentScripts({ ids: [FAKE_DATE_SCRIPT_ID] });
+  }
+}
+
+async function syncLessonDebugScript() {
+  const registered = await chrome.scripting.getRegisteredContentScripts({
+    ids: [LESSON_DEBUG_SCRIPT_ID]
+  });
+  if (registered.length) await chrome.scripting.updateContentScripts([LESSON_DEBUG_SCRIPT]);
+  else await chrome.scripting.registerContentScripts([LESSON_DEBUG_SCRIPT]);
+}
+
+async function queueFakeDateRescan(tabId) {
+  const data = await chrome.storage.session.get(FAKE_DATE_RESCAN_KEY);
+  const pending = data[FAKE_DATE_RESCAN_KEY] || {};
+  pending[tabId] = true;
+  await chrome.storage.session.set({ [FAKE_DATE_RESCAN_KEY]: pending });
+}
+
+async function consumeFakeDateRescan(tabId) {
+  const data = await chrome.storage.session.get(FAKE_DATE_RESCAN_KEY);
+  const pending = data[FAKE_DATE_RESCAN_KEY] || {};
+  if (!pending[tabId]) return false;
+  delete pending[tabId];
+  await chrome.storage.session.set({ [FAKE_DATE_RESCAN_KEY]: pending });
+  return true;
+}
+
+async function setFakeDate(enabled, tabId) {
+  await chrome.storage.local.set({ [FAKE_DATE_KEY]: enabled });
+  await syncFakeDateScript(enabled);
+
+  if (enabled) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['fake-date.js'],
+      world: 'MAIN'
+    }).catch(() => {});
+  }
+
+  await queueFakeDateRescan(tabId);
+  await chrome.tabs.reload(tabId);
+  return { ok: true, enabled, reloading: true };
+}
+
+chrome.storage.local.get(FAKE_DATE_KEY)
+  .then((data) => syncFakeDateScript(Boolean(data[FAKE_DATE_KEY])))
+  .catch(() => {});
+syncLessonDebugScript().catch(() => {});
 
 /* ------------------------------------------------------------------ *
  * Persistencia das deteccoes
@@ -129,6 +230,74 @@ function hostOf(url) {
   }
 }
 
+function pandaEmbedId(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (!PANDA_HOST_RE.test(url.hostname) || !/^player-/i.test(url.hostname)) return null;
+    const id = url.searchParams.get('v') || '';
+    return UUID_RE.test(id) ? id.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function pandaMediaId(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (!PANDA_HOST_RE.test(url.hostname)) return null;
+    const id = url.pathname.split('/').filter(Boolean).find((part) => UUID_RE.test(part));
+    return id ? id.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRejectedMediaUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const mediaId = pandaMediaId(url.href);
+    const internalQuery = [...url.searchParams.keys()].some((key) =>
+      /^(?:error|fallback|placeholder|preview)$/i.test(key)
+    );
+    return Boolean(
+      (mediaId && PANDA_FALLBACK_IDS.has(mediaId)) ||
+      INTERNAL_MEDIA_RE.test(`${url.hostname}${url.pathname}`) ||
+      internalQuery
+    );
+  } catch {
+    return true;
+  }
+}
+
+function activeMediaBindings(frames = []) {
+  const pandaIds = new Set();
+  for (const frame of frames || []) {
+    const urls = [
+      typeof frame === 'string' ? frame : frame?.documentUrl,
+      ...((typeof frame === 'object' && frame?.iframeUrls) || [])
+    ];
+    for (const url of urls) {
+      const id = pandaEmbedId(url);
+      if (id) pandaIds.add(id);
+    }
+  }
+  return { pandaIds };
+}
+
+function playlistMatchesMediaIdentity(stream, probed) {
+  const mediaId = stream.mediaId || pandaMediaId(stream.url);
+  if (!mediaId || !probed?.variants?.length) return true;
+
+  // O CDN Panda responde 200 para um video ausente, mas a playlist mestra
+  // redireciona silenciosamente as variantes para a vinheta de erro. A URL
+  // externa continua com o ID pedido; por isso a identidade precisa ser
+  // conferida tambem dentro do manifesto.
+  return probed.variants.every((variant) => {
+    const variantId = pandaMediaId(variant.url);
+    return !variantId || variantId === mediaId;
+  });
+}
+
 /* ------------------------------------------------------------------ *
  * Estado por aba
  * ------------------------------------------------------------------ */
@@ -149,12 +318,27 @@ function clearTab(tabId, { keepEntry = false } = {}) {
   updateBadge(tabId);
 }
 
-async function addStream(tabId, url, type, formatHint = null) {
+async function addStream(tabId, url, type, formatHint = null, context = {}) {
   await ensureLoaded();
 
+  if (isRejectedMediaUrl(url)) return false;
+
+  const mediaId = pandaMediaId(url);
+  const embedId = pandaEmbedId(context.documentUrl || context.initiator || '');
+  // O player pode trocar sua source pela vinheta interna de erro. Se o frame
+  // identifica a aula pelo ?v=, uma playlist Panda diferente nao pertence a ela.
+  if (mediaId && embedId && mediaId !== embedId) return false;
+
   const list = tabStreams.get(tabId) || [];
-  if (list.some((item) => item.url === url)) return;
-  if (list.length >= MAX_PER_TAB) return;
+  const existing = list.find((item) => item.url === url);
+  if (existing) {
+    if (embedId && mediaId === embedId) existing.boundToEmbed = true;
+    if (!existing.documentUrl && context.documentUrl) existing.documentUrl = context.documentUrl;
+    if (existing.type !== type) existing.sources = [...new Set([...(existing.sources || [existing.type]), type])];
+    persist();
+    return true;
+  }
+  if (list.length >= MAX_PER_TAB) return false;
 
   const resolution = detectResolution(url);
   const format = formatHint || (M3U8_RE.test(url) ? 'hls' : 'file');
@@ -167,12 +351,32 @@ async function addStream(tabId, url, type, formatHint = null) {
     master: looksLikeMaster(url),
     resolution: resolution ? resolution.label : null,
     height: resolution ? resolution.height : null,
+    provider: mediaId ? 'panda' : null,
+    mediaId,
+    documentUrl: context.documentUrl || null,
+    boundToEmbed: Boolean(mediaId && embedId && mediaId === embedId),
     detectedAt: Date.now()
   });
 
   tabStreams.set(tabId, list);
   persist();
   updateBadge(tabId);
+  return true;
+}
+
+function recordLessonNetwork(details, contentType = '') {
+  const context = lessonDebugContexts.get(details.tabId);
+  if (!context || context.network.length >= 150) return;
+  if (!['main_frame', 'xmlhttprequest', 'media', 'object'].includes(details.type) &&
+      !DEBUG_REQUEST_RE.test(details.url || '')) return;
+  context.network.push({
+    transport: 'webRequest',
+    method: details.method || 'GET',
+    type: details.type,
+    url: details.url,
+    status: details.statusCode || null,
+    contentType: contentType || null
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -190,7 +394,10 @@ chrome.webRequest.onBeforeRequest.addListener(
     }
 
     if (!M3U8_RE.test(url) && !MP4_RE.test(url)) return;
-    addStream(tabId, url, type, M3U8_RE.test(url) ? 'hls' : 'file');
+    addStream(tabId, url, type, M3U8_RE.test(url) ? 'hls' : 'file', {
+      documentUrl: details.documentUrl || null,
+      initiator: details.initiator || null
+    });
   },
   { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES }
 );
@@ -203,10 +410,14 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (tabId < 0 || type === 'main_frame') return;
     const contentType = responseHeaders.find((header) => header.name.toLowerCase() === 'content-type');
     const value = (contentType && contentType.value) || '';
+    recordLessonNetwork(details, value);
     const isHls = /(mpegurl|vnd\.apple\.mpegurl)/i.test(value);
     const isMp4 = /video\/mp4/i.test(value) && !/\.googlevideo\.com$/i.test(hostOf(url));
     if (!isHls && !isMp4) return;
-    addStream(tabId, url, type, isHls ? 'hls' : 'file');
+    addStream(tabId, url, type, isHls ? 'hls' : 'file', {
+      documentUrl: details.documentUrl || null,
+      initiator: details.initiator || null
+    });
   },
   { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES },
   ['responseHeaders']
@@ -219,6 +430,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       persist();
     }
   });
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
+  consumeFakeDateRescan(tabId).then((pending) => {
+    if (pending) courseScan(tabId, { force: true });
+  }).catch(() => {});
 });
 
 /* ------------------------------------------------------------------ *
@@ -482,7 +700,6 @@ async function saveBlob({ jobId, objectUrl, filename, container, size }) {
     const downloadId = await chrome.downloads.download({
       url: objectUrl,
       filename,
-      saveAs: false,
       conflictAction: 'uniquify'
     });
     downloadJobs.set(downloadId, jobId);
@@ -676,6 +893,19 @@ async function scanCourse(tabId) {
     ) {
       return { ok: true, course: dataResult };
     }
+    if (dataResult?.ok && result?.ok) {
+      const identifiersByUrl = new Map(
+        dataResult.modules.flatMap((module) =>
+          module.lessons.map((lesson) => [lesson.url, lesson.identifiers || null])
+        )
+      );
+      for (const module of result.modules) {
+        for (const lesson of module.lessons) {
+          const identifiers = identifiersByUrl.get(lesson.url);
+          if (identifiers) lesson.identifiers = identifiers;
+        }
+      }
+    }
     if (result && result.ok) return { ok: true, course: result };
 
     return {
@@ -719,7 +949,8 @@ function cacheCovers(entry, tabUrl) {
   if (!entry.lessonCount) return false;
   try {
     const url = new URL(tabUrl);
-    return entry.origin === url.origin && url.pathname.startsWith(entry.prefix);
+    return entry.origin === url.origin &&
+      url.pathname.toLowerCase().startsWith(entry.prefix.toLowerCase());
   } catch {
     return false;
   }
@@ -860,6 +1091,29 @@ let pumping = false;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * A Hotmart alterna o segmento /content/ para /CONTENT/ em alguns produtos.
+ * Compara a estrutura da rota sem diferenciar caixa, preservando a caixa do
+ * ultimo segmento porque o hash da aula pode ser case-sensitive.
+ */
+function sameLessonUrl(left, right) {
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    if (a.origin !== b.origin) return false;
+    const aParts = a.pathname.split('/').filter(Boolean);
+    const bParts = b.pathname.split('/').filter(Boolean);
+    if (aParts.length !== bParts.length) return false;
+    return aParts.every((part, index) =>
+      index === aParts.length - 1
+        ? part === bParts[index]
+        : part.toLowerCase() === bParts[index].toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
 function saveBatch() {
   chrome.storage.session.set({ [BATCH_KEY]: batch }).catch(() => {});
 }
@@ -902,8 +1156,17 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle) {
       func: async (targetUrl, targetTitle) => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const target = new URL(targetUrl, location.href);
-        if (location.origin === target.origin &&
-            location.pathname.replace(/\/$/, '') === target.pathname.replace(/\/$/, '')) {
+        const samePath = (left, right) => {
+          const a = left.pathname.split('/').filter(Boolean);
+          const b = right.pathname.split('/').filter(Boolean);
+          if (left.origin !== right.origin || a.length !== b.length) return false;
+          return a.every((part, index) =>
+            index === a.length - 1
+              ? part === b[index]
+              : part.toLowerCase() === b[index].toLowerCase()
+          );
+        };
+        if (samePath(new URL(location.href), target)) {
           return { ok: true, method: 'current' };
         }
 
@@ -913,8 +1176,7 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle) {
           if (!raw) return false;
           try {
             const url = new URL(raw, location.href);
-            return url.origin === target.origin &&
-              url.pathname.replace(/\/$/, '') === target.pathname.replace(/\/$/, '');
+            return samePath(url, target);
           } catch {
             return false;
           }
@@ -1012,8 +1274,7 @@ async function waitForTabLoad(tabId, expectedUrl, timeoutMs = PAGE_TIMEOUT_MS) {
       let correctPage = true;
       if (expected) {
         const current = new URL(tab.url || 'about:blank');
-        correctPage = current.origin === expected.origin &&
-          current.pathname.replace(/\/$/, '') === expected.pathname.replace(/\/$/, '');
+        correctPage = sameLessonUrl(current.href, expected.href);
       }
       if (correctPage && tab.status === 'complete') {
         // `complete` antecede a hidratacao do React e a criacao do iframe.
@@ -1026,6 +1287,39 @@ async function waitForTabLoad(tabId, expectedUrl, timeoutMs = PAGE_TIMEOUT_MS) {
     await delay(250);
   }
   return false;
+}
+
+/** Identifica no item da navegacao quando a propria Hotmart adia a liberacao. */
+async function detectLessonLock(tabId, lessonTitle) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [lessonTitle],
+      func: (targetTitle) => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const wanted = clean(targetTitle);
+        if (!wanted) return null;
+        const lockRe =
+          /(libera[cç][aã]o|liberad[oa]|dispon[ií]vel|available|unlocks?)\s*(?:em|in|daqui a)?\s*\d+\s*(dias?|days?|horas?|hours?)/i;
+        const nodes = document.querySelectorAll(
+          'a, button, [role=button], li, [class*=lesson i], [class*=aula i], [class*=content i]'
+        );
+        for (const el of nodes) {
+          const text = clean(el.innerText || el.textContent);
+          if (!text.includes(wanted)) continue;
+          for (let node = el, level = 0; node && level < 4; node = node.parentElement, level++) {
+            const nearby = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+            const match = nearby.match(lockRe);
+            if (match) return match[0];
+          }
+        }
+        return null;
+      }
+    });
+    return (injection && injection.result) || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1156,8 +1450,9 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             }
           }
         }
-        const iframeHosts = queryAll('iframe[src]').map((iframe) => {
-          try { return new URL(iframe.src).hostname; } catch { return 'iframe'; }
+        const iframeUrls = queryAll('iframe[src]').map((iframe) => iframe.src).filter(Boolean);
+        const iframeHosts = iframeUrls.map((src) => {
+          try { return new URL(src).hostname; } catch { return 'iframe'; }
         });
         return {
           documentUrl: location.href,
@@ -1165,6 +1460,7 @@ async function nudgePlay(tabId, { deep = false } = {}) {
           hinted,
           videoCount,
           iframeCount: iframeHosts.length,
+          iframeUrls: iframeUrls.slice(0, 20),
           iframeHosts: [...new Set(iframeHosts)].slice(0, 5),
           shadowRoots: Math.max(0, roots.length - 1)
         };
@@ -1175,12 +1471,18 @@ async function nudgePlay(tabId, { deep = false } = {}) {
     for (const frame of frames) {
       if (frame.result) diagnostics.push(frame.result);
       for (const url of (frame.result && frame.result.urls) || []) {
-        if (M3U8_RE.test(url) || MP4_RE.test(url)) await addStream(tabId, url, 'player');
+        if (M3U8_RE.test(url) || MP4_RE.test(url)) {
+          await addStream(tabId, url, 'player', null, {
+            documentUrl: frame.result.documentUrl
+          });
+        }
       }
       for (const source of (frame.result && frame.result.hinted) || []) {
         try {
           const url = new URL(source.url, frame.result.documentUrl || undefined).href;
-          await addStream(tabId, url, 'player-config', source.format);
+          await addStream(tabId, url, 'player-config', source.format, {
+            documentUrl: frame.result.documentUrl
+          });
         } catch {
           /* URL de configuracao invalida */
         }
@@ -1199,13 +1501,36 @@ async function nudgePlay(tabId, { deep = false } = {}) {
  * entao a decisao vem da leitura da playlist: vale a que declara variantes.
  * Reaproveita o cache de probeMaster.
  */
-async function pickStream(list) {
-  const hls = list.filter((stream) => stream.format !== 'file');
+async function pickStream(list, frames = []) {
+  const { pandaIds } = activeMediaBindings(frames);
+  let candidates = list.filter((stream) => !isRejectedMediaUrl(stream.url));
+
+  // Havendo um embed Panda na aula atual, somente sua propria identidade de
+  // playback pode ser escolhida. Assets do player e fallbacks ficam de fora.
+  if (pandaIds.size) {
+    candidates = candidates.filter((stream) => {
+      const mediaId = stream.mediaId || pandaMediaId(stream.url);
+      return Boolean(mediaId && pandaIds.has(mediaId));
+    });
+  }
+
+  candidates.sort((left, right) => {
+    const score = (stream) =>
+      (stream.boundToEmbed ? 100 : 0) +
+      (stream.type === 'player' ? 30 : 0) +
+      (/^media-resolver/.test(stream.type || '') ? 20 : 0);
+    return score(right) - score(left) || (left.detectedAt || 0) - (right.detectedAt || 0);
+  });
+
+  const hls = candidates.filter((stream) => stream.format !== 'file');
+  let validSingle = null;
   for (const stream of hls) {
     const probed = await probeMaster(stream.url);
+    if (!playlistMatchesMediaIdentity(stream, probed)) continue;
     if (probed && !probed.error && probed.variants.length) return stream;
+    if (probed && !probed.error && probed.single && !validSingle) validSingle = stream;
   }
-  return hls[0] || list.find((stream) => stream.format === 'file') || list[0];
+  return validSingle || candidates.find((stream) => stream.format === 'file') || null;
 }
 
 /** Espera a aba revelar uma playlist, dando tempo para as variantes chegarem. */
@@ -1221,7 +1546,8 @@ async function waitForStream(tabId, timeoutMs = STREAM_TIMEOUT_MS) {
       lastNudge = Date.now();
       const deep = Date.now() - lastDeepScan >= 5000;
       if (deep) lastDeepScan = Date.now();
-      diagnostics = await nudgePlay(tabId, { deep });
+      const latestDiagnostics = await nudgePlay(tabId, { deep });
+      if (latestDiagnostics.length) diagnostics = latestDiagnostics;
     }
     await ensureLoaded();
     const list = tabStreams.get(tabId) || [];
@@ -1229,7 +1555,8 @@ async function waitForStream(tabId, timeoutMs = STREAM_TIMEOUT_MS) {
     if (list.length) {
       if (!firstSeenAt) firstSeenAt = Date.now();
       if (Date.now() - firstSeenAt > 1200) {
-        return { stream: await pickStream(list), diagnostics };
+        const stream = await pickStream(list, diagnostics);
+        if (stream) return { stream, diagnostics };
       }
     }
 
@@ -1246,6 +1573,729 @@ async function waitForJob(jobId, timeoutMs = 45 * 60 * 1000) {
     await delay(400);
   }
   return { status: 'error', error: 'tempo limite do download excedido' };
+}
+
+function lessonIdFromUrl(url) {
+  try {
+    return decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || '');
+  } catch {
+    return '';
+  }
+}
+
+function startLessonDebug(tabId, item) {
+  lessonDebugContexts.set(tabId, {
+    title: item.title,
+    lessonUrl: item.url,
+    lessonId: lessonIdFromUrl(item.url),
+    network: [],
+    attempts: [],
+    videoUrl: null,
+    mediaResolver: null
+  });
+}
+
+function noteLessonDebug(tabId, message) {
+  const context = lessonDebugContexts.get(tabId);
+  if (context) context.attempts.push(message);
+}
+
+async function prepareLessonPageDebug(tabId, item, { reset = false } = {}) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ['lesson-debug.js'],
+      world: 'MAIN'
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      args: [
+        LESSON_DEBUG_STORE_KEY,
+        {
+          title: item.title,
+          url: item.url,
+          lessonId: lessonIdFromUrl(item.url),
+          identifiers: item.identifiers || null
+        },
+        reset
+      ],
+      func: (storeKey, lesson, shouldReset) => {
+        const state = window[storeKey];
+        if (!state) return;
+        if (shouldReset) state.records.length = 0;
+        state.lesson = lesson;
+      }
+    });
+  } catch {
+    /* instrumentacao nunca interfere no fluxo */
+  }
+}
+
+async function collectLessonPageDebug(tabId) {
+  try {
+    const frames = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      args: [LESSON_DEBUG_STORE_KEY],
+      func: (storeKey) => {
+        const state = window[storeKey];
+        if (!state) return null;
+        return {
+          documentUrl: location.href,
+          lesson: state.lesson,
+          records: state.records.slice(-120),
+          snapshots: state.snapshot()
+        };
+      }
+    });
+    return frames
+      .filter((frame) => frame.result)
+      .map((frame) => ({ ...frame.result, frameId: frame.frameId }));
+  } catch {
+    return [];
+  }
+}
+
+const debugScalar = (value) =>
+  typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    ? value
+    : null;
+
+function debugRelatedValue(related, pattern) {
+  for (const entry of related) {
+    if (!pattern.test(entry.path || '')) continue;
+    const value = debugScalar(entry.value);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function normalizePlayerIdKey(key) {
+  const raw = String(key || '').split('.').pop().replace(/[^a-z0-9]/gi, '').toLowerCase();
+  for (const entity of ['lesson', 'content', 'video', 'media', 'asset', 'playback']) {
+    if (raw === entity || raw === `${entity}id`) return `${entity}id`;
+  }
+  return raw === 'id' ? 'id' : '';
+}
+
+function mergePlayerIdentifiers(target, source) {
+  let added = 0;
+  for (const [rawKey, value] of Object.entries(source || {})) {
+    const key = normalizePlayerIdKey(rawKey);
+    if (!key || key === 'id' || value === '' || value == null) continue;
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    if (!Object.prototype.hasOwnProperty.call(target, key) || target[key] !== value) added++;
+    target[key] = value;
+  }
+  return added;
+}
+
+function identifierValueKeys(identifiers) {
+  const values = new Map();
+  for (const [key, value] of Object.entries(identifiers || {})) {
+    if (value === '' || value == null) continue;
+    const scalar = String(value);
+    if (values.has(scalar) && values.get(scalar) !== key) values.set(scalar, null);
+    else if (!values.has(scalar)) values.set(scalar, key);
+  }
+  return values;
+}
+
+function playerSemanticHint(value) {
+  const text = String(value || '');
+  for (const entity of ['playback', 'video', 'media', 'asset', 'content', 'lesson']) {
+    if (new RegExp(entity, 'i').test(text)) return `${entity}id`;
+  }
+  return null;
+}
+
+function playerParameterNames(value, path = '', names = []) {
+  if (!value || typeof value !== 'object' || names.length >= 120) return names;
+  for (const [key, child] of Object.entries(value)) {
+    const nextPath = path ? `${path}.${key}` : key;
+    names.push(nextPath);
+    if (child && typeof child === 'object') playerParameterNames(child, nextPath, names);
+    if (names.length >= 120) break;
+  }
+  return names;
+}
+
+function playerBodyStructure(value, key = '') {
+  if (typeof value === 'string') {
+    if (/^__MEDIA_RESOLVER_ID:[^_]+__$/.test(value)) return value;
+    if (/^(query|document)$/i.test(key)) return value.replace(/\s+/g, ' ').trim();
+    return 'string';
+  }
+  if (typeof value === 'number') return 'number';
+  if (typeof value === 'boolean') return 'boolean';
+  if (value == null) return 'null';
+  if (Array.isArray(value)) return value.map((child) => playerBodyStructure(child, key));
+  return Object.fromEntries(
+    Object.entries(value).map(([childKey, child]) => [childKey, playerBodyStructure(child, childKey)])
+  );
+}
+
+function safeDebugUrl(value) {
+  try {
+    const url = new URL(String(value));
+    for (const key of [...url.searchParams.keys()]) {
+      if (DEBUG_SECRET_RE.test(key)) url.searchParams.set(key, '[REDACTED]');
+    }
+    return url.href.replace(
+      /__MEDIA_RESOLVER_ID%3A([^_]+)__/gi,
+      '__MEDIA_RESOLVER_ID:$1__'
+    );
+  } catch {
+    return String(value || '').replace(
+      /((?:authorization|token|secret|password|signature|api[-_]?key)\s*[=:]\s*)[^&\s,}\]]+/gi,
+      '$1[REDACTED]'
+    );
+  }
+}
+
+function playerOperationName(record) {
+  if (record.requestBody?.operationName) return record.requestBody.operationName;
+  try {
+    return new URL(record.url).searchParams.get('operationName') || null;
+  } catch {
+    return null;
+  }
+}
+
+function playerTemplateSignature(template) {
+  return JSON.stringify({
+    method: template.method,
+    endpoint: template.endpoint,
+    operationName: template.operationName,
+    urlParameters: template.urlParameterNames,
+    body: template.body ? playerBodyStructure(template.body.value) : null
+  });
+}
+
+function templatePlayerValue(value, key, valueKeys, required, semanticHint = null) {
+  const normalizedKey = normalizePlayerIdKey(key);
+  if (typeof value === 'string') {
+    const known = valueKeys.has(value);
+    const knownKey = valueKeys.get(value);
+    const semanticKey = normalizedKey && normalizedKey !== 'id'
+      ? normalizedKey
+      : knownKey || (known ? semanticHint : null);
+    if (semanticKey) {
+      required.add(semanticKey);
+      return `__MEDIA_RESOLVER_ID:${semanticKey}__`;
+    }
+    return value;
+  }
+  if (typeof value === 'number') {
+    const scalar = String(value);
+    const known = valueKeys.has(scalar);
+    const knownKey = valueKeys.get(scalar);
+    const semanticKey = normalizedKey && normalizedKey !== 'id'
+      ? normalizedKey
+      : knownKey || (known ? semanticHint : null);
+    if (semanticKey) {
+      required.add(semanticKey);
+      return `__MEDIA_RESOLVER_ID:${semanticKey}__`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((child) => templatePlayerValue(child, key, valueKeys, required, semanticHint));
+  }
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([childKey, child]) => [
+      childKey,
+      templatePlayerValue(child, childKey, valueKeys, required, semanticHint)
+    ])
+  );
+}
+
+function templatePlayerUrl(rawUrl, frameUrl, valueKeys, required, semanticHint) {
+  try {
+    const url = new URL(String(rawUrl || ''), frameUrl || undefined);
+    url.pathname = url.pathname.split('/').map((part) => {
+      let decoded = part;
+      try { decoded = decodeURIComponent(part); } catch { /* segmento invalido */ }
+      const known = valueKeys.has(decoded);
+      const semanticKey = valueKeys.get(decoded) || (known ? semanticHint : null);
+      if (!semanticKey) return part;
+      required.add(semanticKey);
+      return `__MEDIA_RESOLVER_ID:${semanticKey}__`;
+    }).join('/');
+    for (const [key, rawValue] of [...url.searchParams.entries()]) {
+      if (DEBUG_SECRET_RE.test(key)) return null;
+      const normalizedKey = normalizePlayerIdKey(key);
+      const known = valueKeys.has(rawValue);
+      const knownKey = valueKeys.get(rawValue);
+      const semanticKey = normalizedKey && normalizedKey !== 'id'
+        ? normalizedKey
+        : knownKey || (known ? semanticHint : null);
+      if (semanticKey) {
+        required.add(semanticKey);
+        url.searchParams.set(key, `__MEDIA_RESOLVER_ID:${semanticKey}__`);
+        continue;
+      }
+      if (/^variables$/i.test(key)) {
+        try {
+          const variables = JSON.parse(rawValue);
+          url.searchParams.set(
+            key,
+            JSON.stringify(templatePlayerValue(variables, '', valueKeys, required, semanticHint))
+          );
+        } catch {
+          /* variables nao estavam em JSON */
+        }
+      }
+    }
+    return url.href.replace(
+      /__MEDIA_RESOLVER_ID%3A([^_]+)__/gi,
+      '__MEDIA_RESOLVER_ID:$1__'
+    );
+  } catch {
+    return null;
+  }
+}
+
+function playerTemplateFromRecord(record, frame, valueKeys) {
+  if (!record || record.transport === 'media-resolver') return null;
+  const status = Number(record.status);
+  if (!Number.isFinite(status) || status < 200 || status >= 400) return null;
+  const operationName = playerOperationName(record);
+  const semanticHint = playerSemanticHint(`${operationName || ''} ${record.url || ''}`);
+  const relatedPaths = (record.related || []).map((entry) => entry.path || '').join(' ');
+  if (!PLAYER_FLOW_RE.test(`${record.url || ''} ${operationName || ''} ${relatedPaths}`)) return null;
+
+  const required = new Set();
+  const url = templatePlayerUrl(record.url, frame.documentUrl, valueKeys, required, semanticHint);
+  if (!url) return null;
+  const body = record.requestBody?.value !== undefined
+    ? {
+        format: record.requestBody.format,
+        keys: record.requestBody.keys || [],
+        operationName,
+        value: templatePlayerValue(record.requestBody.value, '', valueKeys, required, semanticHint)
+      }
+    : null;
+  const serialized = JSON.stringify({ url, body });
+  if (/\[REDACTED\]|\[BINARY\]/.test(serialized)) return null;
+  if (!required.size || !/__MEDIA_RESOLVER_ID:/.test(serialized)) return null;
+
+  let frameOrigin = null;
+  try { frameOrigin = new URL(frame.documentUrl).origin; } catch { /* frame sem URL */ }
+  let endpoint = url;
+  try {
+    const parsed = new URL(url);
+    endpoint = parsed.origin + parsed.pathname;
+  } catch { /* URL relativa */ }
+  const urlParameterNames = (() => {
+    try { return [...new URL(url).searchParams.keys()].sort(); } catch { return []; }
+  })();
+  const provides = [];
+  for (const key of Object.keys(record.identifiers || {})) {
+    const normalized = normalizePlayerIdKey(key);
+    if (normalized && normalized !== 'id' && !provides.includes(normalized)) provides.push(normalized);
+  }
+  const template = {
+    method: record.method || 'GET',
+    url,
+    endpoint,
+    operationName,
+    urlParameterNames,
+    parameterNames: [...new Set([
+      ...playerParameterNames(body?.value),
+      ...urlParameterNames
+    ])],
+    body,
+    frameOrigin,
+    requires: [...required],
+    provides,
+    producesMedia: Boolean((record.mediaUrls || []).length)
+  };
+  template.signature = playerTemplateSignature(template);
+  return template;
+}
+
+function identifiersFromFrames(frames, item) {
+  const identifiers = {};
+  mergePlayerIdentifiers(identifiers, item?.identifiers);
+  mergePlayerIdentifiers(identifiers, { lessonId: lessonIdFromUrl(item?.url) });
+  for (const frame of frames) {
+    for (const record of frame.records || []) mergePlayerIdentifiers(identifiers, record.identifiers);
+    for (const snapshot of frame.snapshots || []) mergePlayerIdentifiers(identifiers, snapshot.identifiers);
+  }
+  const related = frames.flatMap((frame) => [
+    ...(frame.records || []).flatMap((record) => record.related || []),
+    ...(frame.snapshots || []).flatMap((snapshot) => snapshot.related || [])
+  ]);
+  for (const entry of related) {
+    const key = String(entry.path || '').split('.').pop();
+    if (!PLAYER_ID_KEY_RE.test(key)) continue;
+    const value = debugScalar(entry.value);
+    const normalized = normalizePlayerIdKey(key);
+    if (normalized && normalized !== 'id' && value !== null && value !== '') identifiers[normalized] = value;
+  }
+  return identifiers;
+}
+
+function mediaCandidatesFromFrames(frames) {
+  return [...new Set(frames.flatMap((frame) => [
+    ...(frame.records || []).flatMap((record) => record.mediaUrls || []),
+    ...(frame.snapshots || []).flatMap((snapshot) => snapshot.mediaUrls || [])
+  ]))];
+}
+
+async function rememberPlayerFlow(tabId, item) {
+  const frames = await collectLessonPageDebug(tabId);
+  const sourceIdentifiers = identifiersFromFrames(frames, item);
+  const valueKeys = identifierValueKeys(sourceIdentifiers);
+  const templates = [];
+  const seen = new Set();
+  const records = frames
+    .flatMap((frame) => (frame.records || []).map((record) => ({ record, frame })))
+    .sort((left, right) => (left.record.at || 0) - (right.record.at || 0));
+  for (const { record, frame } of records) {
+    const template = playerTemplateFromRecord(record, frame, valueKeys);
+    mergePlayerIdentifiers(sourceIdentifiers, record.identifiers);
+    const refreshedValueKeys = identifierValueKeys(sourceIdentifiers);
+    valueKeys.clear();
+    for (const [value, key] of refreshedValueKeys) valueKeys.set(value, key);
+    if (!template || seen.has(template.signature)) continue;
+    seen.add(template.signature);
+    templates.push(template);
+    if (templates.length >= 24) break;
+  }
+  if (!templates.length) return;
+  let origin = null;
+  try { origin = new URL(item.url).origin; } catch { /* URL invalida */ }
+  observedPlayerFlow = {
+    version: 2,
+    origin,
+    learnedAt: Date.now(),
+    templates
+  };
+  await chrome.storage.session.set({ [MEDIA_RESOLVER_TEMPLATE_KEY]: observedPlayerFlow }).catch(() => {});
+  noteLessonDebug(tabId, `cadeia do MEDIA RESOLVER aprendida: ${templates.length} operacao(oes)`);
+}
+
+async function loadObservedPlayerFlow(item) {
+  let origin = null;
+  try { origin = new URL(item.url).origin; } catch { return null; }
+  if (!observedPlayerFlow) {
+    const data = await chrome.storage.session.get(MEDIA_RESOLVER_TEMPLATE_KEY).catch(() => ({}));
+    observedPlayerFlow = data[MEDIA_RESOLVER_TEMPLATE_KEY] || null;
+  }
+  return observedPlayerFlow?.version === 2 && observedPlayerFlow.origin === origin
+    ? observedPlayerFlow
+    : null;
+}
+
+async function addResolvedMediaCandidate(tabId, rawUrl, baseUrl, source) {
+  try {
+    const url = new URL(rawUrl, baseUrl || undefined).href;
+    if (M3U8_RE.test(url) || MP4_RE.test(url)) {
+      const added = await addStream(tabId, url, source, M3U8_RE.test(url) ? 'hls' : 'file', {
+        documentUrl: baseUrl || null
+      });
+      return { playable: Boolean(added), url };
+    }
+    if (MPD_RE.test(url)) return { playable: false, dash: true, url };
+  } catch {
+    /* candidato invalido */
+  }
+  return { playable: false, dash: false, url: null };
+}
+
+async function resolveLessonMedia(tabId, item, playerFrames = []) {
+  const context = lessonDebugContexts.get(tabId);
+  const frames = await collectLessonPageDebug(tabId);
+  const flow = await loadObservedPlayerFlow(item);
+  const identifiers = identifiersFromFrames(frames, item);
+  const bindings = activeMediaBindings([...frames, ...playerFrames]);
+  if (bindings.pandaIds.size === 1) {
+    mergePlayerIdentifiers(identifiers, { videoId: [...bindings.pandaIds][0] });
+  }
+  const templates = flow?.templates || [];
+  const attempts = [];
+  const dashManifests = [];
+
+  console.groupCollapsed('[MEDIA RESOLVER] ' + item.title);
+  console.log('[MEDIA RESOLVER]');
+  console.log('Aula:', item.title);
+  console.log('IDs iniciais:', { ...identifiers });
+  console.log('Operacoes estruturais disponiveis:', templates.map((template) => ({
+    method: template.method,
+    endpoint: safeDebugUrl(template.endpoint),
+    operationName: template.operationName,
+    requires: template.requires,
+    provides: template.provides
+  })));
+
+  for (const rawUrl of mediaCandidatesFromFrames(frames)) {
+    const candidate = await addResolvedMediaCandidate(tabId, rawUrl, item.url, 'media-resolver-state');
+    if (candidate.dash) dashManifests.push(candidate.url);
+  }
+
+  const pending = new Set(templates.map((_template, index) => index));
+  let pass = 0;
+  while (pending.size && pass++ <= templates.length) {
+    let executedInPass = false;
+    for (const index of [...pending]) {
+      const template = templates[index];
+      const missing = (template.requires || []).filter((key) =>
+        !Object.prototype.hasOwnProperty.call(identifiers, key)
+      );
+      if (missing.length) continue;
+      pending.delete(index);
+      executedInPass = true;
+
+      let targetFrame = frames.find((frame) => {
+        try { return new URL(frame.documentUrl).origin === template.frameOrigin; } catch { return false; }
+      });
+      if (!targetFrame) targetFrame = frames.find((frame) => frame.frameId === 0) || frames[0];
+
+      let result = null;
+      try {
+        const injection = await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [targetFrame?.frameId ?? 0] },
+          world: 'MAIN',
+          args: [LESSON_DEBUG_STORE_KEY, [{ ...template, identifiers: { ...identifiers } }]],
+          func: async (storeKey, requests) => {
+            const state = window[storeKey];
+            if (!state || typeof state.resolveApiOperations !== 'function') return [];
+            return state.resolveApiOperations(requests);
+          }
+        });
+        result = injection?.[0]?.result?.[0] || null;
+      } catch (error) {
+        result = {
+          operationName: template.operationName,
+          endpoint: template.endpoint,
+          status: 'injection-error',
+          error: error.message
+        };
+      }
+      if (!result) continue;
+
+      const attempt = {
+        ...result,
+        requires: template.requires || [],
+        provides: template.provides || []
+      };
+      attempts.push(attempt);
+      console.log(`Operacao ${attempts.length}:`, {
+        Endpoint: safeDebugUrl(result.endpoint || template.endpoint),
+        Operation: template.operationName,
+        Requires: template.requires || [],
+        Provides: template.provides || [],
+        Status: result.status,
+        Resultado: result.error || result.responseKeys || []
+      });
+
+      if (Number(result.status) === 401 || Number(result.status) === 403) {
+        attempt.error = `HTTP ${result.status}: caminho encerrado por autorizacao`;
+        continue;
+      }
+
+      mergePlayerIdentifiers(identifiers, result.identifiers);
+      for (const rawUrl of result.mediaUrls || []) {
+        const candidate = await addResolvedMediaCandidate(
+          tabId,
+          rawUrl,
+          template.endpoint || template.frameOrigin,
+          'media-resolver-api'
+        );
+        if (candidate.dash) dashManifests.push(candidate.url);
+      }
+    }
+    if (!executedInPass) break;
+  }
+
+  await ensureLoaded();
+  const candidates = tabStreams.get(tabId) || [];
+  const stream = candidates.length
+    ? await pickStream(candidates, [...frames, ...playerFrames])
+    : null;
+  const unresolved = [...pending].map((index) => {
+    const template = templates[index];
+    return {
+      operationName: template.operationName,
+      endpoint: safeDebugUrl(template.endpoint),
+      missing: (template.requires || []).filter((key) =>
+        !Object.prototype.hasOwnProperty.call(identifiers, key)
+      )
+    };
+  });
+  const foundIds = {
+    lessonId: identifiers.lessonid || null,
+    contentId: identifiers.contentid || null,
+    videoId: identifiers.videoid || null,
+    playbackId: identifiers.playbackid || null,
+    assetId: identifiers.assetid || null,
+    mediaId: identifiers.mediaid || null
+  };
+
+  console.log('IDs resolvidos:', foundIds);
+  console.log('Operacoes pendentes:', unresolved);
+  console.log('Manifest DASH detectado (downloader atual nao suporta DASH):', dashManifests.map(safeDebugUrl));
+  console.log('Manifest/arquivo reproduzivel:', stream ? safeDebugUrl(stream.url) : null);
+  console.log('RESULTADO:', stream ? 'STREAM ENCONTRADO' : 'NENHUM STREAM OBTIDO');
+  console.groupEnd();
+
+  if (context) {
+    context.mediaResolver = {
+      attempts,
+      identifiers: foundIds,
+      unresolved,
+      dashManifests,
+      manifest: stream ? stream.url : null,
+      result: stream ? 'STREAM ENCONTRADO' : 'NENHUM STREAM OBTIDO'
+    };
+  }
+  noteLessonDebug(
+    tabId,
+    templates.length
+      ? `MEDIA RESOLVER: ${attempts.length} operacao(oes), ${stream ? 'stream encontrado' : 'nenhum stream'}`
+      : `MEDIA RESOLVER: sem cadeia aprendida; ${stream ? 'midia encontrada no payload' : 'nenhuma midia no payload'}`
+  );
+  return {
+    stream,
+    diagnostics: [],
+    attempts,
+    hadObservedFlow: templates.length > 0
+  };
+}
+
+async function reportLessonDebug(tabId, item) {
+  const context = lessonDebugContexts.get(tabId);
+  if (!context) return;
+  try {
+    const [frames, domLock] = await Promise.all([
+      collectLessonPageDebug(tabId),
+      detectLessonLock(tabId, item.title)
+    ]);
+    const responseRecords = frames.flatMap((frame) => frame.records || []);
+    const snapshots = frames.flatMap((frame) => frame.snapshots || []);
+    const related = [
+      ...responseRecords.flatMap((record) => record.related || []),
+      ...snapshots.flatMap((snapshot) => snapshot.related || [])
+    ];
+    const responseKeys = [...new Set([
+      ...responseRecords.flatMap((record) => record.responseKeys || []),
+      ...snapshots.flatMap((snapshot) => snapshot.responseKeys || [])
+    ])].slice(0, 150);
+    const accessIndicators = related.filter((entry) =>
+      /(locked|available|release|access|drip|blocked|denied|forbidden)/i.test(entry.path || '')
+    ).slice(0, 40);
+    const requests = [
+      ...context.network,
+      ...responseRecords.map((record) => ({
+        transport: record.transport,
+        method: record.method,
+        url: record.url,
+        status: record.status,
+        requestBody: record.requestBody || null
+      }))
+    ].map((request) => ({
+      ...request,
+      url: safeDebugUrl(request.url),
+      requestBody: request.requestBody
+        ? {
+            format: request.requestBody.format || null,
+            keys: request.requestBody.keys || [],
+            operationName: request.requestBody.operationName || null
+          }
+        : null
+    }));
+    const stateOrigin = domLock
+      ? 'HTML/DOM (texto de liberacao junto ao item da aula)'
+      : accessIndicators.length
+        ? 'Resposta JSON ou estado JavaScript/React'
+        : item.status === 'skipped'
+          ? 'Detector local waitForStream: nenhuma URL HLS/MP4 encontrada'
+          : 'Fluxo local da fila';
+    const videoUrl = context.videoUrl ||
+      related.find((entry) =>
+        typeof entry.value === 'string' &&
+        /(?:\.m3u8|\.mp4|[?&/=]m3u8)/i.test(entry.value)
+      )?.value || null;
+
+    console.groupCollapsed('[DEBUG LESSON] ' + item.title);
+    console.log('[DEBUG LESSON]');
+    console.log('Título:', item.title);
+    console.log('Lesson ID:', context.lessonId || null);
+    console.log('Estado detectado:', domLock ? 'locked (' + domLock + ')' : item.status);
+    console.log('Origem do estado:', stateOrigin);
+    console.log('Request utilizado:', requests.slice(0, 200));
+    console.log('HTTP status:', requests.map(({ method, url, status }) => ({ method, url, status })));
+    console.log('Response keys:', responseKeys);
+    console.log('Video ID:', debugRelatedValue(related, /video.?id$/i));
+    console.log('Playback ID:', debugRelatedValue(related, /playback.?id$/i));
+    console.log('Media ID:', debugRelatedValue(related, /media.?id$/i));
+    console.log('Asset ID:', debugRelatedValue(related, /asset.?id$/i));
+    console.log('Video URL:', videoUrl ? safeDebugUrl(videoUrl) : null);
+    console.log('Indicadores de acesso:', accessIndicators);
+    console.log('Tentativas antes do resultado:', context.attempts);
+    console.log(
+      'Motivo de não continuar:',
+      item.status === 'done' ? 'fluxo continuou para o downloader' : item.error || item.status
+    );
+    console.log('Respostas JSON resumidas:', responseRecords.map((record) => ({
+      transport: record.transport,
+      method: record.method,
+      url: safeDebugUrl(record.url),
+      status: record.status,
+      operationName: record.requestBody?.operationName || null,
+      responseKeys: record.responseKeys || [],
+      related: (record.related || []).slice(0, 40)
+    })));
+    console.log('Estado JavaScript/React resumido:', snapshots.slice(0, 30).map((snapshot) => ({
+      source: snapshot.source,
+      responseKeys: snapshot.responseKeys || [],
+      related: snapshot.related || [],
+      identifiers: snapshot.identifiers || {},
+      mediaUrls: (snapshot.mediaUrls || []).map(safeDebugUrl)
+    })));
+    console.log('Cadeia estrutural do MEDIA RESOLVER:', (observedPlayerFlow?.templates || []).map((template) => ({
+      method: template.method,
+      endpoint: safeDebugUrl(template.endpoint),
+      operationName: template.operationName,
+      parameterNames: template.parameterNames,
+      bodyFormat: template.body?.format || null,
+      requires: template.requires || [],
+      provides: template.provides || []
+    })));
+    if (context.mediaResolver) {
+      console.log('[MEDIA RESOLVER]', {
+        Aula: item.title,
+        LessonID: context.lessonId || null,
+        Tentativas: context.mediaResolver.attempts.map((attempt) => ({
+          operationName: attempt.operationName || null,
+          endpoint: safeDebugUrl(attempt.endpoint || ''),
+          status: attempt.status,
+          requires: attempt.requires || [],
+          provides: attempt.provides || [],
+          responseKeys: attempt.responseKeys || [],
+          videoId: attempt.identifiers?.videoId || attempt.identifiers?.video_id || null,
+          playbackId: attempt.identifiers?.playbackId || attempt.identifiers?.playback_id || null,
+          assetId: attempt.identifiers?.assetId || attempt.identifiers?.asset_id || null,
+          mediaId: attempt.identifiers?.mediaId || attempt.identifiers?.media_id || null,
+          url: (attempt.mediaUrls || []).map(safeDebugUrl),
+          error: attempt.error || null
+        })),
+        IDs: context.mediaResolver.identifiers,
+        Pendentes: context.mediaResolver.unresolved,
+        Manifest: context.mediaResolver.manifest ? safeDebugUrl(context.mediaResolver.manifest) : null,
+        Resultado: context.mediaResolver.result
+      });
+    }
+    console.groupEnd();
+  } catch (error) {
+    console.warn('[DEBUG LESSON] falha ao consolidar diagnostico:', error);
+  } finally {
+    lessonDebugContexts.delete(tabId);
+  }
 }
 
 /** Pausar so vale entre aulas; cancelar interrompe na hora. */
@@ -1271,15 +2321,24 @@ async function runBatchItem(item) {
     }
   }
 
+  const debugTabId = batch.tabId;
+  startLessonDebug(debugTabId, item);
+  try {
+  await prepareLessonPageDebug(debugTabId, item, { reset: true });
+  noteLessonDebug(debugTabId, 'instrumentacao instalada antes da navegacao');
+
   // Nunca deixa a playlist da aula anterior satisfazer a proxima iteracao.
   await ensureLoaded();
   clearTab(batch.tabId, { keepEntry: true });
+  noteLessonDebug(debugTabId, 'URLs de mídia da aula anterior removidas de tabStreams');
 
   const navigation = await navigateToLesson(batch.tabId, item.url, item.title);
+  noteLessonDebug(debugTabId, 'navigateToLesson: ' + navigation.method);
   if (!navigation.ok) {
     try {
       await chrome.tabs.update(batch.tabId, { url: item.url });
       navigation.method = 'recarregamento';
+      noteLessonDebug(debugTabId, 'fallback chrome.tabs.update: recarregamento completo');
     } catch (error) {
       item.status = 'error';
       item.error = `nao foi possivel abrir a aba (${error.message})`;
@@ -1299,11 +2358,19 @@ async function runBatchItem(item) {
       /* a mensagem detalhada e montada abaixo */
     }
   }
+  noteLessonDebug(debugTabId, 'waitForTabLoad: ' + (loaded ? 'URL esperada carregada' : 'falhou/redirect/timeout'));
+  await prepareLessonPageDebug(debugTabId, item);
   if (!loaded) {
+    const lockReason = await detectLessonLock(batch.tabId, item.title);
+    if (lockReason) {
+      item.status = 'locked';
+      item.error = `aula bloqueada pela Hotmart (${lockReason})`;
+      return;
+    }
     item.status = 'error';
     try {
       const actual = (await chrome.tabs.get(batch.tabId)).url || '';
-      item.error = actual && actual !== item.url
+      item.error = actual && !sameLessonUrl(actual, item.url)
         ? `a aula redirecionou para outra pagina (${actual})`
         : 'a pagina nao terminou de carregar';
     } catch {
@@ -1315,10 +2382,30 @@ async function runBatchItem(item) {
 
   item.phase = 'Procurando o video…';
   saveBatch();
+  noteLessonDebug(debugTabId, 'nudgePlay deep: video/src, performance entries, JSON, scripts e React props');
   await nudgePlay(batch.tabId, { deep: true });
 
   const detection = await waitForStream(batch.tabId);
-  const stream = detection.stream;
+  let stream = detection.stream;
+  let streamCameFromResolver = false;
+  noteLessonDebug(
+    debugTabId,
+    stream
+      ? 'waitForStream encontrou mídia e selecionou uma URL'
+      : 'waitForStream encerrou após 20s sem HLS/MP4; nudge a cada 1s e deep scan a cada 5s'
+  );
+  if (!stream && !batchCanceled()) {
+    item.phase = 'MEDIA RESOLVER: consultando APIs...';
+    saveBatch();
+    const resolved = await resolveLessonMedia(batch.tabId, item, detection.diagnostics || []);
+    stream = resolved.stream;
+    streamCameFromResolver = Boolean(stream);
+    item.mediaResolverDeferred = !resolved.hadObservedFlow;
+    detection.diagnostics = [
+      ...(detection.diagnostics || []),
+      ...(resolved.diagnostics || [])
+    ];
+  }
   if (!stream) {
     item.status = 'skipped';
     const diagnostics = detection.diagnostics || [];
@@ -1335,6 +2422,9 @@ async function runBatchItem(item) {
     ].filter(Boolean).join(' · ');
     return;
   }
+  if (!streamCameFromResolver) await rememberPlayerFlow(debugTabId, item);
+  const debugContext = lessonDebugContexts.get(debugTabId);
+  if (debugContext) debugContext.videoUrl = stream.url;
   if (batchCanceled()) return;
 
   item.phase = 'Baixando…';
@@ -1369,6 +2459,9 @@ async function runBatchItem(item) {
     item.status = 'error';
     item.error = finished.error || 'o download falhou';
   }
+  } finally {
+    await reportLessonDebug(debugTabId, item);
+  }
 }
 
 async function pumpBatch() {
@@ -1381,6 +2474,21 @@ async function pumpBatch() {
       if (!batch || batch.status !== 'running') break;
 
       if (batch.cursor >= batch.items.length) {
+        const deferredIndex = observedPlayerFlow
+          ? batch.items.findIndex((item) =>
+              item.status === 'skipped' && item.mediaResolverDeferred && !item.mediaResolverRetried
+            )
+          : -1;
+        if (deferredIndex >= 0) {
+          const deferred = batch.items[deferredIndex];
+          deferred.status = 'pending';
+          deferred.error = null;
+          deferred.phase = null;
+          deferred.mediaResolverRetried = true;
+          batch.cursor = deferredIndex;
+          saveBatch();
+          continue;
+        }
         batch.status = 'done';
         batch.finishedAt = Date.now();
         saveBatch();
@@ -1441,6 +2549,14 @@ async function startBatch({ tabId, courseTitle, items }) {
     items: items.map((item) => ({
       url: item.url,
       title: item.title,
+      identifiers: item.identifiers && typeof item.identifiers === 'object'
+        ? Object.fromEntries(
+            Object.entries(item.identifiers).filter(([key, value]) =>
+              PLAYER_ID_KEY_RE.test(key) &&
+              (typeof value === 'string' || typeof value === 'number')
+            )
+          )
+        : null,
       moduleTitle: item.moduleTitle,
       moduleIndex: item.moduleIndex,
       lessonIndex: item.lessonIndex,
@@ -1496,21 +2612,22 @@ async function resumeBatch() {
   return { ok: true };
 }
 
-/** Recoloca na fila tudo que falhou, sem refazer o que ja deu certo. */
+/** Recoloca falhas na fila e continua pendentes, sem refazer o que deu certo. */
 async function retryFailed() {
   await loadBatch();
   if (!batch || batch.status === 'running') return { ok: false };
 
-  let primeiro = -1;
-  batch.items.forEach((item, index) => {
+  batch.items.forEach((item) => {
     if (item.status !== 'error' && item.status !== 'skipped') return;
     item.status = 'pending';
     item.error = null;
     item.phase = null;
-    if (primeiro < 0) primeiro = index;
   });
 
-  if (primeiro < 0) return { ok: false, error: 'Nenhuma aula para tentar novamente.' };
+  const primeiro = batch.items.findIndex(
+    (item) => item.status === 'pending' || item.status === 'active'
+  );
+  if (primeiro < 0) return { ok: false, error: 'Nenhuma aula restante.' };
 
   batch.cursor = primeiro;
   batch.status = 'running';
@@ -1567,6 +2684,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (type === 'scan-course') {
     courseScan(message.tabId, { force: Boolean(message.force) }).then(sendResponse);
+    return true;
+  }
+
+  if (type === 'set-fake-date') {
+    setFakeDate(Boolean(message.enabled), message.tabId).then(
+      sendResponse,
+      (error) => sendResponse({ ok: false, error: error.message })
+    );
     return true;
   }
 

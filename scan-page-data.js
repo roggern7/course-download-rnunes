@@ -114,17 +114,58 @@
     );
   }
 
+  function lessonIdentifiers(obj, lessonId) {
+    const identifiers = {};
+    if (lessonId) identifiers.lessonId = lessonId;
+    const entityIdKey = /^(lesson|content|video|media|asset|playback)_?id$/i;
+    const queue = [{ value: obj, entity: '', depth: 0 }];
+    const seen = new WeakSet();
+    let visited = 0;
+    while (queue.length && visited < 1000) {
+      const { value, entity, depth } = queue.shift();
+      if (!value || typeof value !== 'object' || seen.has(value) || depth > 5) continue;
+      seen.add(value);
+      visited++;
+      for (const [key, child] of ownEntries(value)) {
+        const match = key.match(entityIdKey);
+        if (match && (typeof child === 'string' || typeof child === 'number')) {
+          identifiers[`${match[1].toLowerCase()}Id`] = child;
+        } else if (/^id$/i.test(key) && entity &&
+                   (typeof child === 'string' || typeof child === 'number')) {
+          identifiers[`${entity}Id`] = child;
+        } else if (child && typeof child === 'object' &&
+                   !/^(_owner|return|stateNode|child|sibling|alternate)$/i.test(key)) {
+          const entityMatch = key.match(/^(lesson|content|video|media|asset|playback)$/i);
+          queue.push({
+            value: child,
+            entity: entityMatch ? entityMatch[1].toLowerCase() : entity,
+            depth: depth + 1
+          });
+        }
+      }
+    }
+    return identifiers;
+  }
+
   function asLesson(obj, assumedLesson = false) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
     const title = directTitle(obj);
     if (!title) return null;
 
     const explicitUrl = directUrl(obj);
-    if (explicitUrl) return { title, url: explicitUrl };
+    let id = directId(obj);
+    if (!id && explicitUrl) {
+      try { id = decodeURIComponent(new URL(explicitUrl).pathname.split('/').filter(Boolean).pop() || ''); }
+      catch { /* URL ja foi validada por directUrl */ }
+    }
+    if (explicitUrl) return { title, url: explicitUrl, identifiers: lessonIdentifiers(obj, id) };
 
-    const id = directId(obj);
     if (!id || (!assumedLesson && !hasStrongId(obj) && !hasMediaEvidence(obj))) return null;
-    return { title, url: new URL(prefix + id, location.origin).href };
+    return {
+      title,
+      url: new URL(prefix + id, location.origin).href,
+      identifiers: lessonIdentifiers(obj, id)
+    };
   }
 
   function lessonsIn(value, assumedLesson, depth = 0) {

@@ -21,12 +21,47 @@ import {
 const CONCURRENCY = 5;
 const RETRIES = 3;
 const PROGRESS_INTERVAL_MS = 200;
+const PANDA_HOST_RE = /(?:^|\.)pandavideo\.com\.br$/i;
+const PANDA_FALLBACK_IDS = new Set([
+  '48af5a59-3ac4-480e-abff-905690d94567',
+  'cd676325-3f2d-4ad5-b95c-c2a683d7b0cc',
+  'f7a741ee-5cad-4f8c-87bc-f6a008776edb'
+]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** @type {{ id: string, controller: AbortController } | null} */
 let active = null;
 
 /** Blob URLs vivas ate o download terminar: jobId -> objectUrl. */
 const liveUrls = new Map();
+
+/* ------------------------------------------------------------------ */
+
+function pandaMediaId(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (!PANDA_HOST_RE.test(url.hostname)) return null;
+    const id = url.pathname.split('/').filter(Boolean).find((part) => UUID_RE.test(part));
+    return id ? id.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function assertRealPandaMedia(masterUrl, variants = []) {
+  const expectedId = pandaMediaId(masterUrl);
+  if (expectedId && PANDA_FALLBACK_IDS.has(expectedId)) {
+    throw new Error('O player devolveu uma mídia interna de erro, não o vídeo da aula.');
+  }
+  if (!expectedId) return;
+  const redirected = variants.find((variant) => {
+    const variantId = pandaMediaId(variant.url);
+    return variantId && variantId !== expectedId;
+  });
+  if (redirected) {
+    throw new Error('O manifesto da aula foi substituído por uma mídia interna de erro do player.');
+  }
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -104,6 +139,7 @@ async function runJob({ jobId, url, format = 'hls', baseName }) {
   const { signal } = controller;
 
   try {
+    assertRealPandaMedia(url);
     if (format === 'file') {
       report(jobId, { phase: 'Baixando o arquivo de video...', container: 'mp4' });
       const blob = await fetchWithRetry(url, signal);
@@ -132,6 +168,8 @@ async function runJob({ jobId, url, format = 'hls', baseName }) {
 
     if (isMasterPlaylist(firstText)) {
       const { variants, sessionKey } = parseMaster(firstText, url);
+
+      assertRealPandaMedia(url, variants);
 
       if (sessionKey) {
         throw new Error(

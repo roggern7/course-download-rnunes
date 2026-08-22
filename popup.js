@@ -17,6 +17,7 @@ const $ = (id) => document.getElementById(id);
 const listEl = $('list');
 const tabTitleEl = $('tab-title');
 const clearBtn = $('clear');
+const fakeDateBtn = $('fake-date');
 const segCurrent = $('view-current');
 const segCourse = $('view-course');
 const segAll = $('view-all');
@@ -51,6 +52,8 @@ let view = 'current';
 let currentTab = null;
 let data = { current: [], all: {}, job: null, batch: null, completed: {} };
 let refreshTimer = null;
+let fakeDateEnabled = false;
+let fakeDateBusy = false;
 
 /** Playlists mestras ja lidas: url -> variantes. */
 const probes = new Map();
@@ -136,12 +139,14 @@ function setBar(percent, indeterminado) {
 }
 
 function contarFila(batch) {
-  const counts = { done: 0, exists: 0, skipped: 0, error: 0 };
+  const counts = {
+    done: 0, exists: 0, skipped: 0, locked: 0, error: 0, pending: 0, active: 0
+  };
   for (const item of batch.items) {
     if (counts[item.status] !== undefined) counts[item.status]++;
   }
   counts.total = batch.items.length;
-  counts.settled = counts.done + counts.exists + counts.skipped + counts.error;
+  counts.settled = counts.done + counts.exists + counts.skipped + counts.locked + counts.error;
   counts.percent = counts.total ? Math.round((counts.settled / counts.total) * 100) : 0;
   return counts;
 }
@@ -150,6 +155,7 @@ function resumoFila(c) {
   const partes = [plural(c.done, 'baixada', 'baixadas')];
   if (c.exists) partes.push(`${c.exists} ja baixadas`);
   if (c.skipped) partes.push(`${c.skipped} sem video`);
+  if (c.locked) partes.push(`${c.locked} bloqueadas`);
   if (c.error) partes.push(`${c.error} com erro`);
   return partes.join(' · ');
 }
@@ -160,9 +166,12 @@ function renderFila(batch, job) {
   const pausada = batch.status === 'paused';
   const terminada = !rodando && !pausada;
   const atual = batch.items[batch.cursor];
-  const firstFailure = batch.items.find((item) =>
-    (item.status === 'error' || item.status === 'skipped') && item.error
-  );
+  // Erro de download/navegacao e mais util que uma aula legitimamente sem
+  // video. Antes, um unico item ignorado escondia dezenas de erros reais.
+  const firstFailure =
+    batch.items.find((item) => item.status === 'error' && item.error) ||
+    batch.items.find((item) => item.status === 'skipped' && item.error) ||
+    batch.items.find((item) => item.status === 'locked' && item.error);
 
   if (rodando && atual) {
     activityTitleEl.textContent = `Aula ${batch.cursor + 1} de ${c.total}`;
@@ -203,6 +212,9 @@ function renderFila(batch, job) {
     if (c.error || c.skipped) {
       const detail = firstFailure ? ` Primeira falha: ${firstFailure.error}.` : '';
       setNote(`${total}${detail} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
+    } else if (c.locked) {
+      const detail = firstFailure ? ` ${firstFailure.error}.` : '';
+      setNote(`${total}${detail} Reescaneie o curso depois da liberacao.`, 'warn');
     } else setNote(total, 'ok');
   } else if (pausada && firstFailure) {
     setNote(`Primeira falha: ${firstFailure.error}.`, 'warn');
@@ -214,8 +226,12 @@ function renderFila(batch, job) {
   batchPauseEl.hidden = terminada;
   batchPauseEl.textContent = pausada ? 'Continuar' : 'Pausar';
   const repetiveis = c.error + c.skipped;
-  batchRetryEl.hidden = !(terminada && repetiveis);
-  batchRetryEl.textContent = `Tentar novamente (${repetiveis})`;
+  const naoProcessadas = c.pending + c.active;
+  const restantes = repetiveis + naoProcessadas;
+  batchRetryEl.hidden = !(terminada && restantes);
+  batchRetryEl.textContent = naoProcessadas
+    ? `Continuar (${restantes})`
+    : `Tentar novamente (${repetiveis})`;
   activityCloseEl.textContent = terminada ? 'Fechar' : 'Cancelar';
 }
 
@@ -397,7 +413,8 @@ function courseCoversTab() {
   if (!course || !course.prefix || !currentTab) return false;
   try {
     const url = new URL(currentTab.url);
-    return course.origin === url.origin && url.pathname.startsWith(course.prefix);
+    return course.origin === url.origin &&
+      url.pathname.toLowerCase().startsWith(course.prefix.toLowerCase());
   } catch {
     return false;
   }
@@ -443,6 +460,7 @@ const STATE_LABEL = {
   done: ['Baixada', 'state-done'],
   exists: ['Ja baixada', 'state-done'],
   skipped: ['Sem video', 'state-skip'],
+  locked: ['Bloqueada', 'state-skip'],
   error: ['Erro', 'state-err']
 };
 
@@ -610,6 +628,7 @@ async function downloadSelected() {
       items.push({
         url: lesson.url,
         title: lesson.title,
+        identifiers: lesson.identifiers || null,
         moduleTitle: mod.title,
         moduleIndex: moduleIndex + 1,
         lessonIndex: lessonIndex + 1,
@@ -793,12 +812,38 @@ clearBtn.addEventListener('click', async () => {
   await refresh();
 });
 
+function renderFakeDate() {
+  fakeDateBtn.textContent = fakeDateEnabled ? 'Fake Date: +7 dias' : 'Fake Date: OFF';
+  fakeDateBtn.setAttribute('aria-pressed', String(fakeDateEnabled));
+  fakeDateBtn.disabled = fakeDateBusy || !currentTab;
+}
+
+fakeDateBtn.addEventListener('click', async () => {
+  if (!currentTab || fakeDateBusy) return;
+  fakeDateBusy = true;
+  renderFakeDate();
+
+  const response = await send({
+    type: 'set-fake-date',
+    tabId: currentTab.id,
+    enabled: !fakeDateEnabled
+  });
+  if (response && response.ok) fakeDateEnabled = response.enabled;
+
+  fakeDateBusy = false;
+  renderFakeDate();
+});
+
 (async function init() {
   currentTab = await getActiveTab();
   tabTitleEl.textContent = currentTab
     ? currentTab.title || currentTab.url || 'Aba sem titulo'
     : 'Nenhuma aba ativa';
   if (currentTab) tabTitleEl.title = currentTab.title || '';
+
+  const fakeDateState = await chrome.storage.local.get('fakeDateEnabled');
+  fakeDateEnabled = Boolean(fakeDateState.fakeDateEnabled);
+  renderFakeDate();
 
   await refresh();
   if (batchActive()) setView('course');
