@@ -2,11 +2,13 @@
   const STORE_KEY = '__COURSE_DOWNLOADER_LESSON_DEBUG__';
   const relevantPage =
     /\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?club\/[^/]+\/products\/[^/]+(?:\/|$)|\/trilhas\/[^/]+(?:\/|$)/i;
-  if (!relevantPage.test(location.pathname) || window[STORE_KEY]?.version === 3) return;
+  const isFathomFrame = /(?:^|\.)fathom\.video$/i.test(location.hostname);
+  if ((!relevantPage.test(location.pathname) && !isFathomFrame) || window[STORE_KEY]?.version === 5) return;
 
-  const RELATED_KEY = /(video|media|playback|asset|stream|manifest|player|content|url|source|lesson|locked|available|release|access|\bid\b)/i;
+  const RELATED_KEY = /(video|media|recording|download|playback|asset|stream|manifest|player|content|url|source|lesson|locked|available|release|access|\bid\b)/i;
   const SENSITIVE_KEY = /(authorization|cookie|token|secret|password|signature|credential|api[-_]?key)/i;
-  const MEDIA_URL = /(?:\.m3u8|\.mpd|\.mp4)(?![a-z0-9])|[?&/=](?:m3u8|mpd)(?![a-z0-9])/i;
+  const MEDIA_URL = /(?:\.m3u8|\.mpd|\.mp4|\.webm|\.mkv|\.mov)(?![a-z0-9])|[?&/=](?:m3u8|mpd)(?![a-z0-9])/i;
+  const MEDIA_KEY = /(?:download|recording|video|media|playback|asset).*(?:url|src)/i;
   const MAX_RECORDS = 120;
 
   const redactText = (value) => {
@@ -95,7 +97,7 @@
   }
 
   const state = {
-    version: 3,
+    version: 5,
     lesson: null,
     records: [],
     inspectPayload,
@@ -162,7 +164,7 @@
     while (queue.length && visited < 1500) {
       const { value, key, entity, depth } = queue.shift();
       if (typeof value === 'string') {
-        if (MEDIA_URL.test(value)) mediaUrls.push(value);
+        if (MEDIA_URL.test(value) || (/^https?:/i.test(value) && MEDIA_KEY.test(key))) mediaUrls.push(value);
         if (/^id$/i.test(key) && entity) identifiers[`${entity}Id`] = value;
         else if (/(?:^|_)(?:lesson|content|video|media|asset|playback)(?:_?id)?$/i.test(key)) identifiers[key] = value;
         continue;
@@ -308,8 +310,20 @@
       try {
         const response = await Reflect.apply(nativeFetch, this, args);
         const requestBody = await requestBodyPromise;
-        const record = { transport: 'fetch', method, url, status: response.status, requestBody };
+        const record = {
+          transport: 'fetch',
+          method,
+          url,
+          status: response.status,
+          requestBody,
+          contentType: response.headers.get('content-type') || ''
+        };
         const contentType = response.headers.get('content-type') || '';
+        const responseUrl = response.url || url;
+        const looksFragment = /\.(?:m4s|cmfv|cmfa|ts)(?:$|[?#])|(?:segment|chunk)[_/-]?\d/i.test(responseUrl);
+        if (!looksFragment && /^(?:video\/|application\/(?:octet-stream|dash\+xml|x-mpegurl))/i.test(contentType)) {
+          record.mediaUrls = [responseUrl];
+        }
         if (/json/i.test(contentType)) {
           response.clone().json().then(
             (payload) => push({ ...record, ...inspectPayload(payload), ...mediaAndIds(payload) }),
@@ -345,6 +359,12 @@
       };
       try {
         const contentType = this.getResponseHeader('content-type') || '';
+        record.contentType = contentType;
+        const responseUrl = this.responseURL || meta.url;
+        const looksFragment = /\.(?:m4s|cmfv|cmfa|ts)(?:$|[?#])|(?:segment|chunk)[_/-]?\d/i.test(responseUrl);
+        if (!looksFragment && /^(?:video\/|application\/(?:octet-stream|dash\+xml|x-mpegurl))/i.test(contentType)) {
+          record.mediaUrls = [responseUrl];
+        }
         if (this.responseType === 'json' && this.response) {
           Object.assign(record, inspectPayload(this.response), mediaAndIds(this.response));
         }

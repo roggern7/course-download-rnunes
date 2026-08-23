@@ -5,8 +5,9 @@
  * Roda fora do service worker porque precisa de URL.createObjectURL e de um
  * contexto que nao seja encerrado no meio do download.
  *
- * Todas as requisicoes saem com `credentials: 'omit'`: nenhum cookie, token ou
- * cabecalho da pagina e reutilizado. Playlists criptografadas sao recusadas.
+ * As requisicoes podem usar a sessao normal do navegador quando a playlist
+ * pertence ao portal autenticado. Nenhum cookie ou token e lido ou persistido
+ * pela extensao. Playlists criptografadas continuam sendo recusadas.
  */
 
 import {
@@ -85,7 +86,7 @@ async function fetchWithRetry(url, signal, asText = false) {
   for (let attempt = 1; attempt <= RETRIES; attempt++) {
     try {
       const response = await fetch(url, {
-        credentials: 'omit',
+        credentials: 'include',
         cache: 'no-store',
         signal
       });
@@ -151,7 +152,7 @@ async function runJob({ jobId, url, format = 'hls', baseName }) {
         type: 'job-blob',
         jobId,
         objectUrl,
-        filename: `Course Downloader RNUNES/${baseName}.mp4`,
+        filename: `${baseName}.mp4`,
         container: 'mp4',
         size: blob.size
       });
@@ -243,7 +244,7 @@ async function runJob({ jobId, url, format = 'hls', baseName }) {
     const objectUrl = URL.createObjectURL(blob);
     liveUrls.set(jobId, objectUrl);
 
-    const filename = `Course Downloader RNUNES/${baseName}.${container}`;
+    const filename = `${baseName}.${container}`;
 
     send({
       type: 'job-blob',

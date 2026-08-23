@@ -83,18 +83,22 @@ function Find-ExtensionId {
   if (-not (Test-Path -LiteralPath $base)) { return $null }
 
   foreach ($perfil in Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue) {
-    $pref = Join-Path $perfil.FullName 'Preferences'
-    if (-not (Test-Path -LiteralPath $pref)) { continue }
-    try {
-      $json = Get-Content -LiteralPath $pref -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch { continue }
-    if (-not $json.extensions.settings) { continue }
+    # Versoes recentes do Chrome guardam extensoes descompactadas em
+    # "Secure Preferences"; versoes anteriores usavam "Preferences".
+    foreach ($arquivo in @('Preferences', 'Secure Preferences')) {
+      $pref = Join-Path $perfil.FullName $arquivo
+      if (-not (Test-Path -LiteralPath $pref)) { continue }
+      try {
+        $json = Get-Content -LiteralPath $pref -Raw -Encoding UTF8 | ConvertFrom-Json
+      } catch { continue }
+      if (-not $json.extensions.settings) { continue }
 
-    foreach ($p in $json.extensions.settings.PSObject.Properties) {
-      $caminho = $p.Value.path
-      $nome    = $p.Value.manifest.name
-      if (($caminho -and $caminho -like '*course-downloader*') -or $nome -like 'Course Downloader*') {
-        return $p.Name
+      foreach ($p in $json.extensions.settings.PSObject.Properties) {
+        $caminho = $p.Value.path
+        $nome    = $p.Value.manifest.name
+        if (($caminho -and $caminho -like '*course-downloader*') -or $nome -like 'Course Downloader*') {
+          return $p.Name
+        }
       }
     }
   }

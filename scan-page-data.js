@@ -51,8 +51,12 @@
   const strongIdKey = /^(uuid|hash|lesson_?id|aula_?id|content_?id|page_?id)$/i;
   const idKey = /^(id|uuid|hash|lesson_?id|aula_?id|content_?id|page_?id)$/i;
   const lessonKey = /(aulas?|lessons?|classes?|pages|paginas|p[aá]ginas|episodes?|episodios?|epis[oó]dios?)/i;
+  // "Extras da trilha" costuma vir em uma coleção separada do array de
+  // aulas. Os itens continuam usando a mesma rota /aulas/<uuid>, mas podem
+  // ser texto, arquivo ou vídeo.
+  const resourceKey = /(b[oô]nus|bonus(?:es)?|extras?)/i;
   const contentKey = /^(contents?|conteudos?|conte[uú]dos?|items?)$/i;
-  const moduleKey = /(modules?|modulos?|m[oó]dulos?|sections?|secoes?|se[cç][oõ]es?|chapters?|capitulos?)/i;
+  const moduleKey = /(modules?|modulos?|m[oó]dulos?|sections?|secoes?|se[cç][oõ]es?|chapters?|capitulos?|b[oô]nus|bonus(?:es)?|extras?)/i;
   const mediaKey = /(video|player|media|duration|dura[cç][aã]o|lesson|aula|episode|epis[oó]dio)/i;
   const MAX_OBJECTS = 50000;
   const MAX_LESSONS = 1000;
@@ -114,6 +118,18 @@
     );
   }
 
+  function directKind(obj) {
+    for (const [key, value] of ownEntries(obj)) {
+      if (!/^(type|tipo|kind|format|content_?type|lesson_?type)$/i.test(key)) continue;
+      const raw = clean(value).toLowerCase();
+      if (/video|vídeo|live|record/.test(raw)) return 'video';
+      if (/file|arquivo|attachment|anexo|document/.test(raw)) return 'file';
+      if (/text|texto|article|artigo/.test(raw)) return 'text';
+      if (/link|url|resource|recurso/.test(raw)) return 'resource';
+    }
+    return null;
+  }
+
   function lessonIdentifiers(obj, lessonId) {
     const identifiers = {};
     if (lessonId) identifiers.lessonId = lessonId;
@@ -158,12 +174,14 @@
       try { id = decodeURIComponent(new URL(explicitUrl).pathname.split('/').filter(Boolean).pop() || ''); }
       catch { /* URL ja foi validada por directUrl */ }
     }
-    if (explicitUrl) return { title, url: explicitUrl, identifiers: lessonIdentifiers(obj, id) };
+    const kind = directKind(obj);
+    if (explicitUrl) return { title, url: explicitUrl, kind, identifiers: lessonIdentifiers(obj, id) };
 
     if (!id || (!assumedLesson && !hasStrongId(obj) && !hasMediaEvidence(obj))) return null;
     return {
       title,
       url: new URL(prefix + id, location.origin).href,
+      kind,
       identifiers: lessonIdentifiers(obj, id)
     };
   }
@@ -185,7 +203,7 @@
     if (lesson) return [lesson];
     for (const [key, child] of ownEntries(value)) {
       if (!child || typeof child !== 'object') continue;
-      if (lessonKey.test(key) || contentKey.test(key)) {
+      if (lessonKey.test(key) || resourceKey.test(key) || contentKey.test(key)) {
         found.push(...lessonsIn(child, true, depth + 1));
       }
     }
@@ -241,6 +259,102 @@
     }
   }
 
+  /**
+   * A Turing Academy renderiza "Extras da trilha" fora das coleções normais
+   * de aulas. Os cards são a fonte mais estável para descobrir os títulos;
+   * o UUID ainda vem dos props/dados React já presentes em `roots`.
+   */
+  function bonusCardsFromDom() {
+    const all = [...document.querySelectorAll('*')];
+    const textOf = (el) => clean(el?.innerText || el?.textContent);
+    const kindOf = (value) => {
+      const label = clean(value).toLowerCase();
+      if (/^(v[ií]deo|video)$/.test(label)) return 'video';
+      if (/^(arquivo|file)$/.test(label)) return 'file';
+      if (/^(texto|text)$/.test(label)) return 'text';
+      return null;
+    };
+    const heading = all.find((el) => /^extras\s+da\s+trilha$/i.test(textOf(el)));
+    if (!heading) return new Map();
+
+    let section = heading.parentElement;
+    for (let node = heading.parentElement; node && node !== document.body; node = node.parentElement) {
+      const labels = String(node.innerText || node.textContent || '')
+        .split(/\r?\n/)
+        .map(clean)
+        .filter((line) => kindOf(line));
+      if (labels.length >= 2) {
+        section = node;
+        break;
+      }
+    }
+    if (!section) return new Map();
+
+    const cards = new Map();
+    const typeElements = [section, ...section.querySelectorAll('*')]
+      .filter((el) => kindOf(textOf(el)));
+    for (const typeElement of typeElements) {
+      const kind = kindOf(textOf(typeElement));
+      let card = typeElement.parentElement;
+      for (let node = typeElement.parentElement; node && node !== section.parentElement; node = node.parentElement) {
+        const lines = String(node.innerText || node.textContent || '')
+          .split(/\r?\n/)
+          .map(clean)
+          .filter(Boolean);
+        const typeCount = lines.filter((line) => kindOf(line)).length;
+        if (typeCount > 1) break;
+        if (typeCount === 1 && lines.length >= 2 && clean(lines.join(' ')).length <= 500) card = node;
+        if (node === section) break;
+      }
+      if (!card) continue;
+
+      const lines = String(card.innerText || card.textContent || '')
+        .split(/\r?\n/)
+        .map(clean)
+        .filter(Boolean);
+      const typeAt = lines.findIndex((line) => kindOf(line));
+      let title = '';
+      for (let index = typeAt - 1; index >= 0; index--) {
+        if (/^\d{1,3}$/.test(lines[index])) continue;
+        if (/^extras\s+da\s+trilha$/i.test(lines[index])) continue;
+        title = lines[index];
+        break;
+      }
+      if (!title || title.length > 200) continue;
+
+      let explicitUrl = '';
+      let explicitId = '';
+      for (const el of [card, ...card.querySelectorAll('*')]) {
+        let attrs = [];
+        try { attrs = [...el.attributes].map((attr) => attr.value); } catch { /* sem atributos */ }
+        for (const raw of attrs) {
+          if (!explicitId && route.acceptsId(clean(raw))) explicitId = clean(raw);
+          try {
+            const url = new URL(raw, location.href);
+            if (!explicitUrl && url.origin === location.origin && url.pathname.startsWith(prefix)) {
+              explicitUrl = url.href;
+            }
+          } catch {
+            const match = String(raw).match(/[0-9a-f]{8}-[0-9a-f-]{27,36}/i);
+            if (!explicitId && match && route.acceptsId(match[0])) explicitId = match[0];
+          }
+        }
+      }
+      cards.set(title.toLocaleLowerCase('pt-BR'), {
+        title,
+        kind,
+        url: explicitUrl || (explicitId ? new URL(prefix + explicitId, location.origin).href : '')
+      });
+    }
+    return cards;
+  }
+
+  const visibleBonusCards = bonusCardsFromDom();
+  const bonusUrl = (title) => new URL(
+    `${prefix}__bonus__-${encodeURIComponent(clean(title).toLocaleLowerCase('pt-BR'))}`,
+    location.origin
+  ).href;
+
   const seenObjects = new WeakSet();
   const seenRoots = new WeakSet();
   const queue = [];
@@ -262,11 +376,26 @@
 
     if (!Array.isArray(value)) {
       const objectTitle = directTitle(value);
+      const visibleBonus = visibleBonusCards.get(objectTitle.toLocaleLowerCase('pt-BR'));
+      if (visibleBonus) {
+        const lesson = asLesson(value, true);
+        if (lesson) addGroup('Extras da trilha', [{
+          ...lesson,
+          title: visibleBonus.title,
+          kind: visibleBonus.kind || lesson.kind,
+          isBonus: true
+        }]);
+      }
 
       // Estrutura preferida: modulo -> aulas/lessons/classes.
       for (const [key, child] of ownEntries(value)) {
         if (!Array.isArray(child)) continue;
-        if (lessonKey.test(key)) addGroup(objectTitle || parentTitle, lessonsIn(child, true));
+        if (lessonKey.test(key) || resourceKey.test(key)) {
+          const groupTitle = resourceKey.test(key) && !resourceKey.test(objectTitle)
+            ? 'Extras da trilha'
+            : (objectTitle || parentTitle || 'Extras da trilha');
+          addGroup(groupTitle, lessonsIn(child, true));
+        }
         else if (contentKey.test(key)) {
           const contents = lessonsIn(child, false);
           if (contents.length) addGroup(objectTitle || parentTitle, contents);
@@ -274,9 +403,12 @@
       }
 
       // Estrutura plana: a propria lista de aulas traz o nome do modulo.
-      if (lessonKey.test(context)) {
+      if (lessonKey.test(context) || resourceKey.test(context)) {
         const lesson = asLesson(value, true);
-        if (lesson) addGroup(parentTitle, [lesson]);
+        if (lesson) addGroup(
+          resourceKey.test(context) ? 'Extras da trilha' : parentTitle,
+          [lesson]
+        );
       }
 
       for (const [key, child] of ownEntries(value)) {
@@ -295,6 +427,30 @@
     }
   }
 
+  // UUIDs encontrados em props podem ser IDs de conteúdo, não IDs de rota.
+  // Para bônus, usa uma chave sintética estável e navega pelo card/título.
+  // Assim nunca tentamos abrir uma URL inventada pela barra do navegador.
+  if (visibleBonusCards.size) {
+    let extras = grouped.get('Extras da trilha');
+    if (!extras) {
+      extras = new Map();
+      grouped.set('Extras da trilha', extras);
+    }
+    for (const bonus of visibleBonusCards.values()) {
+      for (const [url, lesson] of extras) {
+        if (clean(lesson.title).toLocaleLowerCase('pt-BR') ===
+            clean(bonus.title).toLocaleLowerCase('pt-BR')) extras.delete(url);
+      }
+      const url = bonusUrl(bonus.title);
+      extras.set(url, {
+        title: bonus.title,
+        url,
+        kind: bonus.kind,
+        isBonus: true
+      });
+    }
+  }
+
   // Grupos nomeados vencem o agrupamento generico quando ha duplicatas.
   const ordered = [...grouped.entries()].sort(([a], [b]) => (a === 'Aulas') - (b === 'Aulas'));
   const used = new Set();
@@ -306,6 +462,26 @@
       return true;
     });
     if (lessons.length) modules.push({ title, lessons });
+  }
+
+  // O rótulo TEXTO/VÍDEO/ARQUIVO às vezes existe só no cartão renderizado,
+  // não no objeto da API. Usa-o para evitar procurar player em bônus estático.
+  const lessonsByTitle = new Map();
+  for (const module of modules) {
+    for (const lesson of module.lessons) {
+      const key = clean(lesson.title).toLocaleLowerCase('pt-BR');
+      if (key) lessonsByTitle.set(key, lesson);
+    }
+  }
+  for (const el of document.querySelectorAll('h1, h2, h3, h4, strong, [class*="title" i]')) {
+    const key = clean(el.innerText || el.textContent).toLocaleLowerCase('pt-BR');
+    const lesson = lessonsByTitle.get(key);
+    if (!lesson || lesson.kind) continue;
+    const card = el.closest('a, button, li, [role="button"], [class*="card" i], [class*="item" i]');
+    const label = clean((card || el.parentElement || el).innerText || (card || el).textContent).toLowerCase();
+    if (/\b(v[ií]deo|video)\b/.test(label)) lesson.kind = 'video';
+    else if (/\b(arquivo|file)\b/.test(label)) lesson.kind = 'file';
+    else if (/\b(texto|text)\b/.test(label)) lesson.kind = 'text';
   }
 
   const lessonCount = modules.reduce((sum, module) => sum + module.lessons.length, 0);

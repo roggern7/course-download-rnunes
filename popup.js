@@ -152,8 +152,8 @@ function contarFila(batch) {
 }
 
 function resumoFila(c) {
-  const partes = [plural(c.done, 'baixada', 'baixadas')];
-  if (c.exists) partes.push(`${c.exists} ja baixadas`);
+  const partes = [plural(c.done, 'salvo', 'salvos')];
+  if (c.exists) partes.push(`${c.exists} já salvos`);
   if (c.skipped) partes.push(`${c.skipped} sem video`);
   if (c.locked) partes.push(`${c.locked} bloqueadas`);
   if (c.error) partes.push(`${c.error} com erro`);
@@ -174,7 +174,7 @@ function renderFila(batch, job) {
     batch.items.find((item) => item.status === 'locked' && item.error);
 
   if (rodando && atual) {
-    activityTitleEl.textContent = `Aula ${batch.cursor + 1} de ${c.total}`;
+    activityTitleEl.textContent = `Item ${batch.cursor + 1} de ${c.total}`;
     activityTitleEl.title = atual.title;
     activityEl.dataset.tone = 'queue';
   } else if (pausada) {
@@ -184,7 +184,7 @@ function renderFila(batch, job) {
     activityTitleEl.textContent = `Cancelada · ${c.settled} de ${c.total}`;
     activityEl.dataset.tone = 'idle';
   } else {
-    activityTitleEl.textContent = `Fila concluida · ${plural(c.total, 'aula', 'aulas')}`;
+    activityTitleEl.textContent = `Fila concluida · ${plural(c.total, 'item', 'itens')}`;
     activityEl.dataset.tone = c.error ? 'warn' : 'ok';
   }
 
@@ -208,7 +208,7 @@ function renderFila(batch, job) {
   }
 
   if (terminada) {
-    const total = `${plural(c.total, 'aula', 'aulas')}: ${resumoFila(c)}.`;
+    const total = `${plural(c.total, 'item', 'itens')}: ${resumoFila(c)}.`;
     if (c.error || c.skipped) {
       const detail = firstFailure ? ` Primeira falha: ${firstFailure.error}.` : '';
       setNote(`${total}${detail} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
@@ -435,6 +435,7 @@ async function loadCourse(force = false) {
     courseError = (response && response.error) || 'a varredura falhou';
   } else {
     course = response.course;
+    if (response.completed) data.completed = response.completed;
     cachedScan = Boolean(response.cached);
     openModules.clear();
     selected = new Set();
@@ -456,9 +457,9 @@ function batchStatusMap() {
 
 const STATE_LABEL = {
   pending: ['Na fila', 'state-wait'],
-  active: ['Baixando', 'state-active'],
-  done: ['Baixada', 'state-done'],
-  exists: ['Ja baixada', 'state-done'],
+  active: ['Salvando', 'state-active'],
+  done: ['Salvo', 'state-done'],
+  exists: ['Já salvo', 'state-done'],
   skipped: ['Sem video', 'state-skip'],
   locked: ['Bloqueada', 'state-skip'],
   error: ['Erro', 'state-err']
@@ -490,11 +491,12 @@ function buildLesson(lesson, statuses) {
     stateEl.className = `lesson-state ${cls}`;
     stateEl.title = item.error || item.savedPath || '';
   } else if (completed) {
-    stateEl.textContent = 'Ja baixada';
+    stateEl.textContent = 'Já salvo';
     stateEl.className = 'lesson-state state-done';
     stateEl.title = completed.path || completed.filename || '';
   } else {
-    stateEl.textContent = 'Disponivel';
+    const kindLabel = { video: 'Vídeo', text: 'Texto', file: 'Arquivo', resource: 'Recurso' };
+    stateEl.textContent = kindLabel[lesson.kind] || 'Disponível';
     stateEl.className = 'lesson-state state-idle';
   }
 
@@ -518,7 +520,7 @@ function renderCourseView() {
   }
 
   if (courseError) return showEmpty('Nao consegui mapear o curso', courseError);
-  if (!course) return showEmpty('Curso ainda nao escaneado', 'Clique em "Reescanear" para listar as aulas.');
+  if (!course) return showEmpty('Curso ainda não escaneado', 'Clique em "Reescanear" para listar os itens.');
 
   const statuses = batchStatusMap();
 
@@ -532,7 +534,7 @@ function renderCourseView() {
   sub.className = 'course-sub';
   const partes = [
     plural(course.modules.length, 'modulo', 'modulos'),
-    plural(course.lessonCount, 'aula', 'aulas')
+    plural(course.lessonCount, 'item', 'itens')
   ];
   if (course.scannedAt) partes.push(cachedScan ? `escaneado ${desde(course.scannedAt)}` : 'escaneado agora');
   sub.textContent = partes.join(' · ');
@@ -603,7 +605,7 @@ function syncSelectionUi() {
 
   countCourseEl.textContent = String(selected.size);
   downloadSelectedBtn.textContent = selected.size
-    ? `Baixar ${plural(selected.size, 'aula', 'aulas')}`
+    ? `Baixar ${plural(selected.size, 'item', 'itens')}`
     : 'Baixar';
   downloadSelectedBtn.disabled = !selected.size || busy();
 }
@@ -628,6 +630,8 @@ async function downloadSelected() {
       items.push({
         url: lesson.url,
         title: lesson.title,
+        kind: lesson.kind || null,
+        isBonus: Boolean(lesson.isBonus),
         identifiers: lesson.identifiers || null,
         moduleTitle: mod.title,
         moduleIndex: moduleIndex + 1,
@@ -726,7 +730,7 @@ async function render(force = false) {
     course ? [course.courseTitle, course.modules.map((m) => m.lessons.length)] : null,
     [...openModules].sort(),
     data.batch ? [data.batch.status, data.batch.cursor, data.batch.items.map((i) => i.status)] : null,
-    Object.keys(data.completed || {}).length,
+    Object.keys(data.completed || {}).sort(),
     data.current.map((s) => s.url),
     allEntries.map(([tabId, list]) => [tabId, list.length])
   ]);
@@ -787,6 +791,13 @@ async function refresh() {
   const response = await send({ type: 'get-state', tabId: currentTab.id });
   if (!response) return;
   data = response;
+  if (course && !batchActive()) {
+    for (const module of course.modules) {
+      for (const lesson of module.lessons) {
+        if ((data.completed || {})[lesson.url]) selected.delete(lesson.url);
+      }
+    }
+  }
   await render();
 }
 

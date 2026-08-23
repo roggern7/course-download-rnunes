@@ -8,8 +8,8 @@
  *    progresso para o popup.
  *
  * Somente URLs de playlist sao lidas. Nenhum cabecalho, cookie ou token da
- * pagina e lido, armazenado ou reenviado; as requisicoes da extensao saem sem
- * credenciais. Playlists criptografadas ou com DRM sao recusadas.
+ * pagina e lido ou armazenado; quando o portal exige autenticacao, o proprio
+ * navegador pode usar a sessao corrente. DRM e criptografia sao recusados.
  */
 
 import {
@@ -18,6 +18,12 @@ import {
   isMasterPlaylist,
   sanitizeFilename
 } from './hls.js';
+import {
+  downloadMatchesKind,
+  downloadMatchesLesson,
+  lessonDownloadBases,
+  normalizeDownloadPath
+} from './download-paths.js';
 
 const STORAGE_KEY = 'streams';
 const MAX_PER_TAB = 200;
@@ -43,6 +49,7 @@ const LESSON_DEBUG_SCRIPT = {
   js: ['lesson-debug.js'],
   runAt: 'document_start',
   world: 'MAIN',
+  allFrames: true,
   persistAcrossSessions: true
 };
 
@@ -58,6 +65,7 @@ const OBSERVED_TYPES = [
 const M3U8_RE = /\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i;
 const MP4_RE = /\.mp4(?![a-z0-9])|[?&]format=mp4(?![a-z0-9])/i;
 const MPD_RE = /\.mpd(?![a-z0-9])|[?&/=]mpd(?![a-z0-9])/i;
+const WEBM_RE = /\.(?:webm|mkv|mov)(?![a-z0-9])|[?&]format=(?:webm|mkv|mov)(?![a-z0-9])/i;
 const PANDA_HOST_RE = /(?:^|\.)pandavideo\.com\.br$/i;
 const PANDA_FALLBACK_IDS = new Set([
   // Player Panda: substitutos internos para 403 e sharelock/comparison invalido.
@@ -76,6 +84,8 @@ let loading = null;
 
 /** Cache de leituras de playlist mestra: url -> { variants, best, error }. */
 const masterCache = new Map();
+/** Cache de validacao de arquivos diretos; impede salvar uma pagina HTML como video. */
+const directMediaCache = new Map();
 
 /** Estado do unico job de download ativo/recente. */
 let job = null;
@@ -334,6 +344,8 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
   if (existing) {
     if (embedId && mediaId === embedId) existing.boundToEmbed = true;
     if (!existing.documentUrl && context.documentUrl) existing.documentUrl = context.documentUrl;
+    if (!existing.contentType && context.contentType) existing.contentType = context.contentType;
+    if (context.verifiedByHeaders) existing.verifiedByHeaders = true;
     if (existing.type !== type) existing.sources = [...new Set([...(existing.sources || [existing.type]), type])];
     persist();
     return true;
@@ -341,7 +353,7 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
   if (list.length >= MAX_PER_TAB) return false;
 
   const resolution = detectResolution(url);
-  const format = formatHint || (M3U8_RE.test(url) ? 'hls' : 'file');
+  const format = formatHint || (M3U8_RE.test(url) ? 'hls' : (MPD_RE.test(url) ? 'dash' : 'file'));
   list.push({
     url,
     name: shortName(url),
@@ -354,6 +366,8 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
     provider: mediaId ? 'panda' : null,
     mediaId,
     documentUrl: context.documentUrl || null,
+    contentType: context.contentType || null,
+    verifiedByHeaders: Boolean(context.verifiedByHeaders),
     boundToEmbed: Boolean(mediaId && embedId && mediaId === embedId),
     detectedAt: Date.now()
   });
@@ -393,8 +407,9 @@ chrome.webRequest.onBeforeRequest.addListener(
       return;
     }
 
-    if (!M3U8_RE.test(url) && !MP4_RE.test(url)) return;
-    addStream(tabId, url, type, M3U8_RE.test(url) ? 'hls' : 'file', {
+    if (!M3U8_RE.test(url) && !MP4_RE.test(url) && !MPD_RE.test(url) && !WEBM_RE.test(url)) return;
+    const format = M3U8_RE.test(url) ? 'hls' : (MPD_RE.test(url) ? 'dash' : 'file');
+    addStream(tabId, url, type, format, {
       documentUrl: details.documentUrl || null,
       initiator: details.initiator || null
     });
@@ -412,11 +427,30 @@ chrome.webRequest.onHeadersReceived.addListener(
     const value = (contentType && contentType.value) || '';
     recordLessonNetwork(details, value);
     const isHls = /(mpegurl|vnd\.apple\.mpegurl)/i.test(value);
-    const isMp4 = /video\/mp4/i.test(value) && !/\.googlevideo\.com$/i.test(hostOf(url));
-    if (!isHls && !isMp4) return;
-    addStream(tabId, url, type, isHls ? 'hls' : 'file', {
+    const isDash = /(application\/dash\+xml|application\/mpd)/i.test(value);
+    const fathomContext = /https?:\/\/(?:[^/]+\.)?fathom\.video\b/i.test(
+      `${details.documentUrl || ''} ${details.initiator || ''}`
+    );
+    // O bonus "Call Ao Vivo Gravada" monta o player do Fathom diretamente no
+    // DOM do portal (sem iframe). Nesse caso documentUrl/initiator continuam
+    // apontando para a Turing Academy, embora o arquivo venha do Google Video.
+    // Durante a captura isolada de uma aula, o contexto ativo da propria aba e
+    // um vinculo mais confiavel que o dominio do documento.
+    const activeLessonCapture = lessonDebugContexts.has(tabId);
+    const googleVideoAllowed = !/\.googlevideo\.com$/i.test(hostOf(url)) ||
+      fathomContext || activeLessonCapture;
+    const isMp4 = /video\/mp4/i.test(value) && googleVideoAllowed;
+    const looksFragment = /\.(?:m4s|cmfv|cmfa|ts)(?:$|[?#])|(?:segment|chunk)[_/-]?\d/i.test(url);
+    const isOtherVideo = !looksFragment && (
+      /video\/(?:webm|quicktime|x-matroska|ogg)/i.test(value) ||
+      (type === 'media' && /application\/octet-stream/i.test(value))
+    );
+    if (!isHls && !isDash && !isMp4 && !isOtherVideo) return;
+    addStream(tabId, url, type, isHls ? 'hls' : (isDash ? 'dash' : 'file'), {
       documentUrl: details.documentUrl || null,
-      initiator: details.initiator || null
+      initiator: details.initiator || null,
+      contentType: value,
+      verifiedByHeaders: true
     });
   },
   { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES },
@@ -445,7 +479,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 async function fetchText(url, signal) {
   const response = await fetch(url, {
-    credentials: 'omit',
+    // A playlist pode pertencer ao proprio portal autenticado. Nao copiamos
+    // nem persistimos cookies; o navegador decide quais credenciais da sessao
+    // podem acompanhar esta requisicao.
+    credentials: 'include',
     cache: 'no-store',
     signal
   });
@@ -488,6 +525,64 @@ async function probeMaster(url) {
   }
 
   masterCache.set(url, result);
+  return result;
+}
+
+async function probeDirectMedia(url) {
+  if (directMediaCache.has(url)) return directMediaCache.get(url);
+  const inspect = (response) => {
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    const finalUrl = response.url || url;
+    const html = /(?:text\/html|application\/xhtml\+xml)/i.test(contentType);
+    const mediaType = /^video\//i.test(contentType) ||
+      /application\/(?:octet-stream|x-mpegurl)/i.test(contentType);
+    const mediaUrl = MP4_RE.test(finalUrl) || WEBM_RE.test(finalUrl);
+    return {
+      valid: Boolean(response.ok && !html && (mediaType || mediaUrl)),
+      rejectedHtml: html,
+      contentType,
+      finalUrl
+    };
+  };
+
+  let result = { valid: false, rejectedHtml: false, contentType: '', finalUrl: url };
+  try {
+    const head = await fetch(url, {
+      method: 'HEAD',
+      credentials: 'include',
+      cache: 'no-store',
+      redirect: 'follow'
+    });
+    result = inspect(head);
+    if (result.valid || result.rejectedHtml) {
+      directMediaCache.set(url, result);
+      return result;
+    }
+  } catch {
+    /* alguns CDNs recusam HEAD; tenta apenas o primeiro byte */
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-0' },
+        credentials: 'include',
+        cache: 'no-store',
+        redirect: 'follow',
+        signal: controller.signal
+      });
+      result = inspect(response);
+      try { await response.body?.cancel(); } catch { /* corpo ja encerrado */ }
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch {
+    /* candidato nao verificavel nao e tratado como video */
+  }
+  directMediaCache.set(url, result);
   return result;
 }
 
@@ -607,9 +702,9 @@ async function startDownload({ tabId, url, format = 'hls', baseName: explicitNam
     return { ok: false, error: 'Ja existe um download em andamento.' };
   }
 
-  // Em lote o caminho ja vem pronto (Curso/Modulo/Aula); avulso, le da pagina.
+  // Em lote o caminho completo ja vem pronto; avulso usa a raiz padrao.
   const title = explicitName || (await getLessonTitle(tabId));
-  const baseName = explicitName || sanitizeFilename(title);
+  const baseName = explicitName || `Course Downloader RNUNES/${sanitizeFilename(title)}`;
 
   newJob({ tabId, sourceUrl: url, title, baseName });
 
@@ -846,6 +941,78 @@ async function tryAutoRemux(target) {
   return true;
 }
 
+async function nativeFileExists(file) {
+  if (!file || remuxHostAvailable === false) return false;
+  const response = await sendNative({ action: 'exists', file });
+  if (!response.ok && /not found|nao encontrado|Specified native messaging host/i.test(response.error || '')) {
+    remuxHostAvailable = false;
+  } else if (response.ok) {
+    remuxHostAvailable = true;
+  }
+  return Boolean(response.ok && response.exists);
+}
+
+/**
+ * O documento offscreen monta HLS, mas um manifesto DASH pode separar audio e
+ * video em trilhas diferentes. O host nativo entrega a URL ao FFmpeg e grava o
+ * MP4 na mesma pasta indicada por um pequeno arquivo marcador do Chrome.
+ */
+async function downloadNativeMedia(item, url) {
+  if (remuxHostAvailable === false) {
+    return {
+      ok: false,
+      error: 'o vídeo precisa do conversor automático (FFmpeg/host nativo) instalado'
+    };
+  }
+
+  const markerName = `.destino-${Date.now()}.tmp`;
+  const marker = await saveChromeResource(
+    'data:text/plain;charset=utf-8,destino%20temporario',
+    `${item.path}/${markerName}`
+  );
+  if (!marker.ok || !marker.download?.filename) {
+    return { ok: false, error: `não foi possível preparar a pasta do vídeo: ${marker.error || 'caminho indisponível'}` };
+  }
+
+  const response = await sendNative({
+    action: 'download-media',
+    url,
+    marker: marker.download.filename,
+    name: `${sanitizeFilename(item.title, 'Video')}.mp4`,
+    referer: item.actualUrl || item.url || ''
+  });
+  if (!response.ok) {
+    try { await chrome.downloads.removeFile(marker.downloadId); } catch { /* o host pode ter removido */ }
+    if (/not found|nao encontrado|Specified native messaging host/i.test(response.error || '')) {
+      remuxHostAvailable = false;
+    }
+    return { ok: false, error: response.error || 'o conversor não conseguiu baixar o vídeo' };
+  }
+
+  remuxHostAvailable = true;
+  let output = response.output;
+  if (item.isBonus && output) {
+    const folderName = String(item.path || '').split('/').filter(Boolean).pop();
+    const organized = await sendNative({
+      action: 'place-in-folder',
+      file: output,
+      folderName
+    });
+    if (organized.ok && organized.output) output = organized.output;
+  }
+  return {
+    ok: true,
+    status: 'done',
+    filename: String(output).split(/[\\/]/).pop(),
+    savedPath: output,
+    container: 'mp4',
+    downloadId: marker.downloadId,
+    downloadIds: [marker.downloadId],
+    remuxed: true,
+    exists: true
+  };
+}
+
 async function closeOffscreenIfIdle() {
   if (job && job.status === 'running') return;
   try {
@@ -886,26 +1053,52 @@ async function scanCourse(tabId) {
       });
       dataResult = dataInjection && dataInjection.result;
     }
-    if (
-      dataResult &&
-      dataResult.ok &&
-      (!result || !result.ok || dataResult.lessonCount > result.lessonCount)
-    ) {
-      return { ok: true, course: dataResult };
-    }
     if (dataResult?.ok && result?.ok) {
-      const identifiersByUrl = new Map(
-        dataResult.modules.flatMap((module) =>
-          module.lessons.map((lesson) => [lesson.url, lesson.identifiers || null])
-        )
+      // Os dois scanners veem partes diferentes na Turing Academy: o DOM
+      // comum encontra as aulas e os dados React encontram "Extras da trilha".
+      // Escolher apenas a lista maior descartava exatamente os quatro bônus.
+      const modules = result.modules.map((module) => ({
+        ...module,
+        lessons: module.lessons.map((lesson) => ({ ...lesson }))
+      }));
+      const modulesByTitle = new Map(
+        modules.map((module) => [String(module.title || '').trim().toLocaleLowerCase('pt-BR'), module])
       );
-      for (const module of result.modules) {
-        for (const lesson of module.lessons) {
-          const identifiers = identifiersByUrl.get(lesson.url);
-          if (identifiers) lesson.identifiers = identifiers;
+      const lessonsByUrl = new Map(
+        modules.flatMap((module) => module.lessons.map((lesson) => [lesson.url, lesson]))
+      );
+
+      for (const dataModule of dataResult.modules) {
+        const moduleKey = String(dataModule.title || '').trim().toLocaleLowerCase('pt-BR');
+        let target = modulesByTitle.get(moduleKey);
+        for (const dataLesson of dataModule.lessons) {
+          const existing = lessonsByUrl.get(dataLesson.url);
+          if (existing) {
+            if (dataLesson.identifiers) existing.identifiers = dataLesson.identifiers;
+            if (dataLesson.kind) existing.kind = dataLesson.kind;
+            continue;
+          }
+          if (!target) {
+            target = { title: dataModule.title || 'Itens', lessons: [] };
+            modules.push(target);
+            modulesByTitle.set(moduleKey, target);
+          }
+          const added = { ...dataLesson };
+          target.lessons.push(added);
+          lessonsByUrl.set(added.url, added);
         }
       }
+      return {
+        ok: true,
+        course: {
+          ...result,
+          modules,
+          lessonCount: modules.reduce((sum, module) => sum + module.lessons.length, 0),
+          source: `${result.source || 'pagina'} + dados da pagina`
+        }
+      };
     }
+    if (dataResult?.ok) return { ok: true, course: dataResult };
     if (result && result.ok) return { ok: true, course: result };
 
     return {
@@ -969,14 +1162,13 @@ async function courseScan(tabId, { force = false } = {}) {
     /* aba fechada */
   }
 
-  // Momento certo para reconferir o que ja foi baixado: e agora que a lista de
-  // aulas sera montada e marcada.
-  await verifyCompleted();
-
   if (!force && tabUrl) {
     const cache = await getCourseCache();
     const hit = Object.values(cache).find((entry) => cacheCovers(entry, tabUrl));
-    if (hit) return { ok: true, course: hit, cached: true };
+    if (hit) {
+      const completed = await reconcileCourseDownloads(hit);
+      return { ok: true, course: hit, completed, cached: true };
+    }
   }
 
   const result = await scanCourse(tabId);
@@ -997,7 +1189,8 @@ async function courseScan(tabId, { force = false } = {}) {
     await chrome.storage.local.set({ [COURSE_KEY]: cache }).catch(() => {});
   }
 
-  return { ok: true, course: entry, cached: false };
+  const completed = await reconcileCourseDownloads(entry);
+  return { ok: true, course: entry, completed, cached: false };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1017,10 +1210,17 @@ async function getCompleted() {
 
 async function markCompleted(lessonUrl, info) {
   const all = await getCompleted();
+  const downloadIds = Array.isArray(info.downloadIds)
+    ? info.downloadIds.filter((id) => Number.isInteger(id))
+    : (Number.isInteger(info.downloadId) ? [info.downloadId] : []);
   all[lessonUrl] = {
     filename: info.filename || null,
     path: info.savedPath || null,
-    downloadId: info.downloadId || null,
+    downloadId: downloadIds[0] || null,
+    downloadIds,
+    container: info.container || null,
+    remuxed: Boolean(info.remuxed),
+    validatedBonus: Boolean(info.validatedBonus),
     at: Date.now()
   };
   await chrome.storage.local.set({ [DONE_KEY]: all }).catch(() => {});
@@ -1028,10 +1228,20 @@ async function markCompleted(lessonUrl, info) {
 
 /** O arquivo daquele registro ainda esta no disco? Na duvida, responde nao. */
 async function arquivoAindaExiste(registro) {
-  if (!registro || !registro.downloadId) return false;
+  const ids = Array.isArray(registro?.downloadIds) && registro.downloadIds.length
+    ? registro.downloadIds
+    : (registro?.downloadId ? [registro.downloadId] : []);
+  if (!ids.length) {
+    return Boolean(registro?.path) && await nativeFileExists(registro.path);
+  }
   try {
-    const [item] = await chrome.downloads.search({ id: registro.downloadId });
-    return Boolean(item) && item.exists !== false;
+    const found = await Promise.all(ids.map(async (id) => {
+      const [item] = await chrome.downloads.search({ id });
+      return Boolean(item) && item.exists !== false;
+    }));
+    if (found.every(Boolean)) return true;
+    return ids.length === 1 && /\.mp4$/i.test(registro?.path || '') &&
+      await nativeFileExists(registro.path);
   } catch {
     return false;
   }
@@ -1052,17 +1262,28 @@ async function verifyCompleted() {
 
   let mudou = false;
   for (const [url, entry] of entradas) {
-    if (!entry || !entry.downloadId) {
+    const ids = Array.isArray(entry?.downloadIds) && entry.downloadIds.length
+      ? entry.downloadIds
+      : (entry?.downloadId ? [entry.downloadId] : []);
+    if (!ids.length && entry?.path && await nativeFileExists(entry.path)) continue;
+    if (!ids.length) {
       delete all[url];
       mudou = true;
       continue;
     }
     try {
-      const [item] = await chrome.downloads.search({ id: entry.downloadId });
-      if (!item || item.exists === false) {
+      const items = await Promise.all(ids.map(async (id) => {
+        const [item] = await chrome.downloads.search({ id });
+        return item || null;
+      }));
+      const item = items[0];
+      const missing = items.some((download) => !download || download.exists === false);
+      const remuxedExists = missing && ids.length === 1 && /\.mp4$/i.test(entry?.path || '') &&
+        await nativeFileExists(entry.path);
+      if (missing && !remuxedExists) {
         delete all[url];
         mudou = true;
-      } else if (item.filename && item.filename !== entry.path) {
+      } else if (!missing && item.filename && item.filename !== entry.path) {
         entry.path = item.filename; // o usuario pode ter movido o arquivo
         mudou = true;
       }
@@ -1072,6 +1293,132 @@ async function verifyCompleted() {
   }
 
   if (mudou) await chrome.storage.local.set({ [DONE_KEY]: all }).catch(() => {});
+  return all;
+}
+
+/**
+ * Reconstrói o registro por Curso/Módulo/Item usando o histórico do Chrome.
+ * Isso recupera downloads feitos antes de o mapa `completed` existir e também
+ * associa um .ts removido ao .mp4 criado pelo host de conversão.
+ */
+async function reconcileCourseDownloads(course) {
+  const all = await getCompleted();
+  let downloads = [];
+  try {
+    downloads = await chrome.downloads.search({
+      state: 'complete',
+      limit: 10000,
+      orderBy: ['-startTime']
+    });
+  } catch {
+    return all;
+  }
+
+  const history = downloads
+    .filter((download) => download && download.filename)
+    .map((download) => ({ download, path: normalizeDownloadPath(download.filename) }));
+  const matches = [];
+
+  course.modules.forEach((module, moduleIndex) => {
+    module.lessons.forEach((lesson, lessonIndex) => {
+      const base = lessonPath(course.courseTitle, {
+        moduleTitle: module.title,
+        moduleIndex: moduleIndex + 1,
+        title: lesson.title,
+        lessonIndex: lessonIndex + 1
+      });
+      const candidates = history.filter(({ path }) =>
+        downloadMatchesLesson(path, base, { videoOnly: lesson.kind === 'video' }) &&
+        downloadMatchesKind(path, lesson.kind)
+      );
+      const preferred = candidates.find(({ path }) =>
+        lesson.kind === 'file'
+          ? /\.(?:docx?|pdf|xlsx?|pptx?|zip|rar|7z)$/i.test(path)
+          : lesson.kind === 'text'
+            ? /\.(?:txt|md)$/i.test(path)
+            : /\/conteudo(?: \(\d+\))?\.md$/i.test(path)
+      ) || candidates[0];
+      matches.push({ lesson, preferred, base });
+    });
+  });
+
+  // O historico do Chrome pode ser apagado sem remover os arquivos. Quando
+  // isso acontece, usa o host local ja instalado para conferir diretamente os
+  // caminhos esperados dentro de Downloads.
+  const missingFromHistory = matches.filter(({ preferred }) => !preferred);
+  if (missingFromHistory.length && remuxHostAvailable !== false) {
+    const response = await sendNative({
+      action: 'find-course-files',
+      items: missingFromHistory.map(({ lesson, base }) => ({
+        key: lesson.url,
+        bases: lessonDownloadBases(base),
+        kind: lesson.kind || null
+      }))
+    });
+    if (response.ok) {
+      remuxHostAvailable = true;
+      for (const match of missingFromHistory) {
+        const filename = response.matches?.[match.lesson.url];
+        if (!filename) continue;
+        match.preferred = {
+          path: normalizeDownloadPath(filename),
+          download: { id: null, filename, exists: true, state: 'complete', native: true }
+        };
+      }
+    } else if (/not found|nao encontrado|Specified native messaging host/i.test(response.error || '')) {
+      remuxHostAvailable = false;
+    }
+  }
+
+  const missingTs = [...new Set(matches
+    .map(({ preferred }) => preferred?.download)
+    .filter((download) => download?.exists === false && /\.ts$/i.test(download.filename || ''))
+    .map((download) => download.filename))];
+  let remuxedBySource = {};
+  if (missingTs.length && remuxHostAvailable !== false) {
+    const response = await sendNative({ action: 'find-remuxed-many', files: missingTs });
+    if (response.ok) {
+      remuxHostAvailable = true;
+      remuxedBySource = response.matches || {};
+    } else if (/not found|nao encontrado|Specified native messaging host/i.test(response.error || '')) {
+      remuxHostAvailable = false;
+    }
+  }
+
+  let changed = false;
+  for (const { lesson, preferred } of matches) {
+    const download = preferred?.download;
+    const remuxedPath = download ? remuxedBySource[download.filename] : null;
+    const valid = Boolean(download && (download.exists !== false || remuxedPath));
+    if (!valid) {
+      const existing = all[lesson.url];
+      const existingPath = existing?.path || existing?.filename || '';
+      if (existing && (
+        !downloadMatchesKind(existingPath, lesson.kind) ||
+        !(await arquivoAindaExiste(existing))
+      )) {
+        delete all[lesson.url];
+        changed = true;
+      }
+      continue;
+    }
+
+    const savedPath = remuxedPath || download.filename;
+    const previous = all[lesson.url];
+    if (!previous || previous.downloadId !== download.id || previous.path !== savedPath) changed = true;
+    all[lesson.url] = {
+      filename: String(savedPath).split(/[\\/]/).pop(),
+      path: savedPath,
+      downloadId: Number.isInteger(download.id) ? download.id : null,
+      downloadIds: Number.isInteger(download.id) ? [download.id] : [],
+      container: /\.mp4$/i.test(savedPath) ? 'mp4' : (/\.ts$/i.test(savedPath) ? 'ts' : null),
+      remuxed: Boolean(remuxedPath),
+      validatedBonus: Boolean(lesson.isBonus),
+      at: previous?.at || Date.now()
+    };
+  }
+
+  if (changed) await chrome.storage.local.set({ [DONE_KEY]: all }).catch(() => {});
   return all;
 }
 
@@ -1129,17 +1476,401 @@ async function loadBatch() {
   return batch;
 }
 
-/** Monta Curso/Modulo/Aula, numerando so o que ainda nao comeca com numero. */
+/** Monta Raiz/Curso/Modulo/Aula, numerando so o que ainda nao comeca com numero. */
 function lessonPath(courseTitle, item) {
   const pad = (n) => String(n).padStart(2, '0');
   const numbered = (index, title) =>
     /^\d/.test(String(title).trim()) ? title : `${pad(index)} - ${title}`;
 
   return [
+    'Course Downloader RNUNES',
     sanitizeFilename(courseTitle, 'Curso'),
     sanitizeFilename(numbered(item.moduleIndex, item.moduleTitle), `Modulo ${pad(item.moduleIndex)}`),
     sanitizeFilename(numbered(item.lessonIndex, item.title), `Aula ${pad(item.lessonIndex)}`)
   ].join('/');
+}
+
+/** Aguarda um download comum (texto, anexo ou ZIP), sem usar o worker de vídeo. */
+async function waitForChromeDownload(downloadId, timeoutMs = 10 * 60 * 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [download] = await chrome.downloads.search({ id: downloadId });
+    if (!download) return { ok: false, error: 'o download desapareceu da lista do Chrome' };
+    if (download.state === 'complete') {
+      return download.exists === false
+        ? { ok: false, error: 'o arquivo foi removido depois do download' }
+        : { ok: true, download };
+    }
+    if (download.state === 'interrupted') {
+      return { ok: false, error: download.error || 'download interrompido' };
+    }
+    if (batchCanceled()) return { ok: false, canceled: true, error: 'fila cancelada' };
+    await delay(350);
+  }
+  return { ok: false, error: 'tempo limite ao salvar o recurso' };
+}
+
+async function saveChromeResource(url, filename) {
+  try {
+    const downloadId = await chrome.downloads.download({
+      url,
+      filename,
+      conflictAction: 'uniquify',
+      saveAs: false
+    });
+    const result = await waitForChromeDownload(downloadId);
+    return { ...result, downloadId };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/**
+ * Extrai apenas o conteúdo que a página já exibiu ao usuário. Além do texto,
+ * registra links, anexos e repositórios GitHub. React props são consultadas no
+ * MAIN world para alcançar botões de arquivo que não usam <a href>.
+ */
+async function capturePageResources(tabId, expectedTitle) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      args: [expectedTitle],
+      func: (wantedTitle) => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const normalized = (value) => clean(value).toLocaleLowerCase('pt-BR');
+        const wanted = normalized(wantedTitle);
+        const visible = (el) => {
+          if (!el || !el.isConnected) return false;
+          const style = getComputedStyle(el);
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        };
+
+        const titleCandidates = [];
+        for (const el of document.querySelectorAll('body *')) {
+          const text = normalized(el.innerText || el.textContent);
+          if (!visible(el) || !text || el.closest('aside, nav, header')) continue;
+          if (text === wanted) {
+            const childRepeats = [...el.children].some((child) =>
+              normalized(child.innerText || child.textContent) === text
+            );
+            if (childRepeats) continue;
+            titleCandidates.push(el);
+          }
+        }
+        titleCandidates.sort((left, right) =>
+          right.getBoundingClientRect().left - left.getBoundingClientRect().left
+        );
+        const titleElement = titleCandidates.find((el) =>
+          el.getBoundingClientRect().left > innerWidth * 0.2
+        ) || null;
+
+        const semanticSelector = [
+          'article', '[role="main"]', 'main',
+          '[class*="lesson-content" i]', '[class*="content-body" i]',
+          '[class*="lesson-body" i]', '[class*="article-body" i]'
+        ].join(',');
+        let localContainer = null;
+        for (let node = titleElement?.parentElement; node && node !== document.body; node = node.parentElement) {
+          const length = clean(node.innerText || node.textContent).length;
+          const hasResource = Boolean(node.querySelector(
+            'a[href], [download], [data-download-url], [data-file-url], iframe[src], embed[src], object[data]'
+          )) || [...node.querySelectorAll('button, [role="button"]')].some((button) =>
+            /baixar|download|anexo|arquivo|modelo/i.test(button.innerText || button.textContent)
+          );
+          if ((hasResource || length >= wanted.length + 100) && length <= 20000) {
+            localContainer = node;
+            break;
+          }
+          if (length > 20000) break;
+        }
+        const scope = localContainer || titleElement?.closest(semanticSelector) ||
+          [...document.querySelectorAll(semanticSelector)].find(visible) || document.body;
+
+        const clone = scope.cloneNode(true);
+        for (const el of clone.querySelectorAll(
+          'script, style, noscript, nav, aside, header, footer, iframe, video, audio, canvas, svg, form, [aria-hidden="true"]'
+        )) el.remove();
+        const blockTags = new Set([
+          'ADDRESS', 'ARTICLE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIGCAPTION',
+          'FIGURE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'MAIN', 'P', 'PRE',
+          'SECTION', 'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL', 'OL'
+        ]);
+        const textParts = [];
+        const walkText = (node) => {
+          if (node.nodeType === Node.TEXT_NODE) {
+            textParts.push(node.nodeValue || '');
+            return;
+          }
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          if (node.tagName === 'BR') textParts.push('\n');
+          const block = blockTags.has(node.tagName);
+          if (block) textParts.push('\n');
+          for (const child of node.childNodes) walkText(child);
+          if (block) textParts.push('\n');
+        };
+        walkText(clone);
+        let text = textParts.join('')
+          .replace(/[ \t]+/g, ' ')
+          .replace(/\r/g, '')
+          .replace(/[ \t]+\n/g, '\n')
+          .replace(/\n[ \t]+/g, '\n')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+        if (text.length > 500000) text = text.slice(0, 500000) + '\n\n[conteúdo truncado]';
+
+        const links = new Map();
+        const attachments = new Map();
+        const repositories = new Map();
+        const fileExt = /\.(?:pdf|docx?|xlsx?|pptx?|csv|tsv|zip|rar|7z|txt|md|rtf|odt|ods|odp|epub)(?:$|[?#])/i;
+        const addUrl = (raw, label = '', forceAttachment = false) => {
+          if (typeof raw !== 'string' || !raw.trim()) return;
+          let url;
+          try { url = new URL(raw, location.href); } catch { return; }
+          if (!/^https?:$/.test(url.protocol)) return;
+          const href = url.href;
+          const safeLabel = clean(label) || href;
+
+          if (/^(?:www\.)?github\.com$/i.test(url.hostname)) {
+            const parts = url.pathname.split('/').filter(Boolean);
+            if (parts.length === 2 && !/^(?:settings|marketplace|features|topics|collections)$/i.test(parts[0])) {
+              const repoName = decodeURIComponent(parts[1].replace(/\.git$/i, ''));
+              const canonical = `https://github.com/${parts[0]}/${repoName}`;
+              repositories.set(canonical, {
+                url: canonical,
+                name: `${decodeURIComponent(parts[0])} - ${repoName}`,
+                archiveUrl: `${canonical}/archive/HEAD.zip`
+              });
+            }
+          }
+
+          links.set(href, { url: href, label: safeLabel });
+          const looksDownload = forceAttachment || fileExt.test(href) ||
+            /(?:baixar|download|attachment|arquivo|anexo|modelo|template)/i.test(url.pathname + ' ' + safeLabel);
+          if (!looksDownload || /github\.com$/i.test(url.hostname)) return;
+          const fromPath = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
+          attachments.set(href, { url: href, name: clean(label) || fromPath || 'Anexo' });
+        };
+
+        for (const el of scope.querySelectorAll(
+          'a[href], [download], [data-download-url], [data-file-url], [data-href], [data-url], iframe[src], embed[src], object[data]'
+        )) {
+          const label = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.title);
+          const raw = el.getAttribute('href') || el.getAttribute('data-download-url') ||
+            el.getAttribute('data-file-url') || el.getAttribute('data-href') || el.getAttribute('data-url') ||
+            el.getAttribute('src') || el.getAttribute('data');
+          addUrl(raw, el.getAttribute('download') || label, el.hasAttribute('download'));
+        }
+        for (const match of text.matchAll(/https?:\/\/[^\s<>()\[\]"']+/gi)) {
+          addUrl(match[0].replace(/[.,;:!?]+$/, ''), match[0]);
+        }
+
+        // URLs escondidas nas props dos botões React (caso comum em ARQUIVO).
+        const seen = new WeakSet();
+        const queue = [];
+        for (const el of scope.querySelectorAll('button, [role="button"], a, [class*="download" i], [class*="anexo" i]')) {
+          let propertyNames = [];
+          try { propertyNames = Object.getOwnPropertyNames(el); } catch { /* nó protegido */ }
+          for (const key of propertyNames) {
+            if (key.startsWith('__reactProps$')) queue.push({ value: el[key], depth: 0 });
+          }
+        }
+        let visited = 0;
+        while (queue.length && visited < 3000) {
+          const { value, depth } = queue.shift();
+          if (!value || typeof value !== 'object' || seen.has(value) || depth > 5) continue;
+          seen.add(value);
+          visited++;
+          let entries = [];
+          try { entries = Object.entries(value); } catch { continue; }
+          for (const [key, child] of entries) {
+            if (typeof child === 'string') {
+              if (/url|href|download|file|arquivo|anexo/i.test(key) || /^https?:\/\//i.test(child)) {
+                addUrl(child, key, /download|file|arquivo|anexo/i.test(key));
+              }
+            } else if (child && typeof child === 'object' &&
+                       !/^(_owner|return|stateNode|child|sibling|alternate)$/i.test(key)) {
+              queue.push({ value: child, depth: depth + 1 });
+            }
+          }
+        }
+
+        return {
+          title: clean(wantedTitle) || clean(document.title),
+          matchedTitle: Boolean(titleElement),
+          sourceUrl: location.href,
+          text,
+          links: [...links.values()].slice(0, 300),
+          attachments: [...attachments.values()].slice(0, 30),
+          repositories: [...repositories.values()].slice(0, 20)
+        };
+      }
+    });
+    return injection?.result || null;
+  } catch (error) {
+    return { error: error.message, text: '', links: [], attachments: [], repositories: [] };
+  }
+}
+
+function buildResourceText(capture) {
+  const title = String(capture.title || '').replace(/\s+/g, ' ').trim();
+  const normalizedTitle = title.toLocaleLowerCase('pt-BR');
+  const contentLines = String(capture.text || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter((line) => {
+      const normalized = line.toLocaleLowerCase('pt-BR');
+      return line &&
+        normalized !== normalizedTitle &&
+        normalized !== 'bônus selecionado' &&
+        normalized !== 'bonus selecionado' &&
+        !/^(?:texto|arquivo|vídeo|video|fechar)$/i.test(line) &&
+        !/^b[oô]nus\s+\d+$/i.test(line);
+    });
+  const lines = [contentLines.join('\r\n')];
+  const missingLinks = (capture.links || []).filter((link) =>
+    link.url && !String(capture.text || '').includes(link.url)
+  );
+  if (missingLinks.length) {
+    lines.push('', 'LINKS');
+    for (const link of missingLinks) lines.push(`${link.label}\n${link.url}`);
+  }
+  return lines.join('\r\n').trim() + '\r\n';
+}
+
+function resourceFilename(rawName, fallback, sourceUrl = '') {
+  let name = String(rawName || '').trim();
+  let sourceExt = '';
+  try {
+    const url = new URL(sourceUrl);
+    const hinted = url.searchParams.get('filename') || url.searchParams.get('file') ||
+      url.searchParams.get('name') || '';
+    sourceExt = decodeURIComponent(hinted || url.pathname).match(/\.[a-z0-9]{1,8}$/i)?.[0] || '';
+  } catch {
+    /* URL sem nome de arquivo */
+  }
+  if (!/\.[a-z0-9]{1,8}$/i.test(name) && sourceExt) name += sourceExt;
+  return sanitizeFilename(name, fallback);
+}
+
+async function probeResourceExtension(url) {
+  try {
+    const response = await fetch(url, { method: 'HEAD', credentials: 'include', cache: 'no-store' });
+    if (!response.ok) return '';
+    const disposition = response.headers.get('content-disposition') || '';
+    const encoded = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+    const plain = disposition.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1];
+    const filename = decodeURIComponent(encoded || plain || '').trim();
+    const byName = filename.match(/\.[a-z0-9]{1,8}$/i)?.[0];
+    if (byName) return byName;
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (/application\/pdf/.test(contentType)) return '.pdf';
+    if (/wordprocessingml/.test(contentType)) return '.docx';
+    if (/msword/.test(contentType)) return '.doc';
+    if (/spreadsheetml/.test(contentType)) return '.xlsx';
+    if (/presentationml/.test(contentType)) return '.pptx';
+    if (/text\/plain/.test(contentType)) return '.txt';
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+async function saveCapturedResources(item, capture) {
+  if (!capture || capture.error) {
+    return { ok: false, error: capture?.error || 'não foi possível ler o conteúdo da página' };
+  }
+  if (item.isBonus && !capture.matchedTitle) {
+    return { ok: false, error: `a página aberta não corresponde ao bônus "${item.title}"` };
+  }
+  const hasUsefulContent = capture.text || capture.links.length ||
+    capture.attachments.length || capture.repositories.length;
+  if (!hasUsefulContent) return { ok: false, error: 'a página não exibiu texto, links ou anexos' };
+  if (item.kind === 'file' && !capture.attachments.length) {
+    return { ok: false, error: 'o bônus é um arquivo, mas o link do anexo não foi encontrado' };
+  }
+
+  const results = [];
+  const usedNames = new Set();
+  const uniqueName = (raw, fallback, url) => {
+    const original = resourceFilename(raw, fallback, url);
+    let name = original;
+    let copy = 2;
+    while (usedNames.has(name.toLowerCase())) {
+      const match = original.match(/^(.*?)(\.[^.]+)?$/);
+      name = `${match[1]} (${copy++})${match[2] || ''}`;
+    }
+    usedNames.add(name.toLowerCase());
+    return name;
+  };
+
+  for (const [index, attachment] of capture.attachments.entries()) {
+    if (batchCanceled()) break;
+    item.phase = `Salvando anexo ${index + 1} de ${capture.attachments.length}…`;
+    saveBatch();
+    let requestedName = item.kind === 'file' && capture.attachments.length === 1
+      ? item.title
+      : attachment.name;
+    if (item.kind === 'file' && !/\.[a-z0-9]{1,8}$/i.test(
+      resourceFilename(requestedName, '', attachment.url)
+    )) {
+      requestedName += await probeResourceExtension(attachment.url);
+    }
+    const name = uniqueName(requestedName, `Anexo ${index + 1}`, attachment.url);
+    results.push({
+      type: 'attachment',
+      label: name,
+      result: await saveChromeResource(attachment.url, `${item.path}/${name}`)
+    });
+  }
+
+  if (item.kind === 'file') {
+    const savedAttachment = results.find((entry) =>
+      entry.type === 'attachment' && entry.result.ok
+    );
+    const failedAttachment = results.find((entry) =>
+      entry.type === 'attachment' && !entry.result.ok
+    );
+    if (!savedAttachment) {
+      return {
+        ok: false,
+        error: 'o anexo do contrato falhou: ' + (failedAttachment?.result.error || 'erro desconhecido')
+      };
+    }
+    return {
+      ok: true,
+      downloadId: savedAttachment.result.downloadId,
+      downloadIds: results.filter((entry) => entry.result.ok).map((entry) => entry.result.downloadId),
+      filename: savedAttachment.label,
+      savedPath: savedAttachment.result.download?.filename || `${item.path}/${savedAttachment.label}`,
+      warnings: results.filter((entry) => !entry.result.ok).map((entry) => entry.result.error)
+    };
+  }
+
+  if (batchCanceled()) return { ok: false, canceled: true, error: 'fila cancelada' };
+  item.phase = 'Salvando o conteúdo…';
+  saveBatch();
+  const contentText = buildResourceText(capture);
+  const contentUrl = `data:text/plain;charset=utf-8,${encodeURIComponent(contentText)}`;
+  const indexName = `${sanitizeFilename(item.title, 'Conteudo')}.txt`;
+  const indexResult = await saveChromeResource(contentUrl, `${item.path}/${indexName}`);
+  results.unshift({ type: 'index', label: indexName, result: indexResult });
+
+  const saved = results.filter((entry) => entry.result.ok);
+  const failed = results.filter((entry) => !entry.result.ok && !entry.result.canceled);
+  if (!indexResult.ok) return { ok: false, error: `não foi possível salvar ${indexName}: ${indexResult.error}` };
+  if (item.kind === 'file' && !saved.some((entry) => entry.type === 'attachment')) {
+    return { ok: false, error: 'o índice foi salvo, mas o anexo falhou: ' + failed.map((entry) => entry.result.error).join(' · ') };
+  }
+  return {
+    ok: true,
+    downloadId: indexResult.downloadId,
+    downloadIds: saved.map((entry) => entry.result.downloadId),
+    filename: indexName,
+    savedPath: indexResult.download?.filename || `${item.path}/${indexName}`,
+    warnings: failed.map((entry) => `${entry.label}: ${entry.result.error}`)
+  };
 }
 
 /**
@@ -1147,13 +1878,13 @@ function lessonPath(courseTitle, item) {
  * criado corretamente pela rota interna do React; recarregar a URL inteira
  * pode reconstruir apenas a pagina textual e nunca inicializar o video.
  */
-async function navigateToLesson(tabId, lessonUrl, lessonTitle) {
+async function navigateToLesson(tabId, lessonUrl, lessonTitle, { byTitleOnly = false } = {}) {
   try {
     const [injection] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      args: [lessonUrl, lessonTitle],
-      func: async (targetUrl, targetTitle) => {
+      args: [lessonUrl, lessonTitle, byTitleOnly],
+      func: async (targetUrl, targetTitle, titleOnly) => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const target = new URL(targetUrl, location.href);
         const samePath = (left, right) => {
@@ -1166,8 +1897,21 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle) {
               : part.toLowerCase() === b[index].toLowerCase()
           );
         };
-        if (samePath(new URL(location.href), target)) {
+        if (!titleOnly && samePath(new URL(location.href), target)) {
           return { ok: true, method: 'current' };
+        }
+        if (titleOnly) {
+          const wanted = clean(targetTitle);
+          const alreadyOpen = [...document.querySelectorAll('body *')].some((el) => {
+            if (clean(el.innerText || el.textContent) !== wanted) return false;
+            const childRepeats = [...el.children].some((child) =>
+              clean(child.innerText || child.textContent) === wanted
+            );
+            if (childRepeats) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.left > innerWidth * 0.2;
+          });
+          if (alreadyOpen) return { ok: true, method: 'current-bonus' };
         }
 
         const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1207,12 +1951,14 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle) {
           /navegue\s+pelas\s+aulas/i.test(el.innerText || el.textContent)
         ) || menuScopes[0] || document;
         const findTarget = () => {
-          for (const el of document.querySelectorAll(
-            'a[href], [data-href], [data-url], [data-link], [data-to], [data-path]'
-          )) {
-            if (urlAttrs.some((attr) => sameTarget(el.getAttribute(attr)))) {
-              const targetControl = clickable(el);
-              if (targetControl) return targetControl;
+          if (!titleOnly) {
+            for (const el of document.querySelectorAll(
+              'a[href], [data-href], [data-url], [data-link], [data-to], [data-path]'
+            )) {
+              if (urlAttrs.some((attr) => sameTarget(el.getAttribute(attr)))) {
+                const targetControl = clickable(el);
+                if (targetControl) return targetControl;
+              }
             }
           }
 
@@ -1289,6 +2035,42 @@ async function waitForTabLoad(tabId, expectedUrl, timeoutMs = PAGE_TIMEOUT_MS) {
   return false;
 }
 
+/** Confirma que o conteúdo central aberto corresponde ao card de bônus clicado. */
+async function waitForOpenedTitle(tabId, expectedTitle, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  await delay(300);
+  while (Date.now() < deadline) {
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: { tabId },
+        args: [expectedTitle],
+        func: (title) => {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('pt-BR');
+          const wanted = clean(title);
+          const candidates = [];
+          for (const el of document.querySelectorAll('body *')) {
+            if (el.closest('aside, nav, header')) continue;
+            if (clean(el.innerText || el.textContent) !== wanted) continue;
+            const childRepeats = [...el.children].some((child) =>
+              clean(child.innerText || child.textContent) === wanted
+            );
+            if (!childRepeats) candidates.push(el);
+          }
+          return candidates.some((el) => el.getBoundingClientRect().left > innerWidth * 0.2);
+        }
+      });
+      if (injection?.result) {
+        const tab = await chrome.tabs.get(tabId);
+        return { ok: true, url: tab.url || '' };
+      }
+    } catch {
+      /* página ainda navegando */
+    }
+    await delay(300);
+  }
+  return { ok: false, url: '' };
+}
+
 /** Identifica no item da navegacao quando a propria Hotmart adia a liberacao. */
 async function detectLessonLock(tabId, lessonTitle) {
   try {
@@ -1333,10 +2115,14 @@ async function nudgePlay(tabId, { deep = false } = {}) {
       target: { tabId, allFrames: true },
       world: 'MAIN',
       args: [deep],
-      func: (deepScan) => {
+      func: async (deepScan) => {
         const urls = new Set();
         const hinted = [];
         let videoCount = 0;
+        let videoStarted = false;
+        let needsGesture = false;
+        let playClickTarget = '';
+        const videos = [];
         const roots = [document];
         for (let index = 0; index < roots.length; index++) {
           for (const el of roots[index].querySelectorAll('*')) {
@@ -1345,9 +2131,20 @@ async function nudgePlay(tabId, { deep = false } = {}) {
         }
         const queryAll = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
 
+        for (const iframe of queryAll('iframe')) {
+          try {
+            const lazySrc = iframe.getAttribute('data-src') || iframe.getAttribute('data-lazy-src');
+            if (!iframe.src && lazySrc) iframe.src = lazySrc;
+            iframe.scrollIntoView({ block: 'center', inline: 'nearest' });
+          } catch {
+            /* iframe protegido */
+          }
+        }
+
         for (const video of queryAll('video')) {
           try {
             videoCount++;
+            videos.push(video);
             if (video.currentSrc) urls.add(video.currentSrc);
             if (video.src) urls.add(video.src);
             for (const source of video.querySelectorAll('source[src]')) urls.add(source.src);
@@ -1355,25 +2152,119 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             video.autoplay = true;
             if (!video.currentSrc && (video.src || video.querySelector('source[src]'))) video.load();
             const played = video.play();
-            if (played && played.catch) played.catch(() => {});
+            if (played && typeof played.then === 'function') {
+              const outcome = await Promise.race([
+                played.then(() => 'played', () => 'rejected'),
+                new Promise((resolve) => setTimeout(() => resolve('pending'), 800))
+              ]);
+              if (outcome !== 'played' && video.paused) needsGesture = true;
+            }
+            // Alguns players antigos retornam undefined em play(); outros
+            // resolvem a Promise antes de atualizar o estado. O estado real do
+            // elemento decide se ainda precisamos acionar o controle visual.
+            if (video.paused) needsGesture = true;
+            else videoStarted = true;
           } catch {
-            /* autoplay bloqueado */
+            needsGesture = true;
           }
         }
 
         // Players que so criam o <video> depois do primeiro gesto.
-        if (!videoCount) {
-          const play = queryAll(
-            '.vjs-big-play-button, .plyr__control--overlaid, .ytp-large-play-button, button[aria-label*="play" i], button[title*="play" i], button[aria-label*="reprodu" i]'
-          )[0];
+        if (!videoCount || (!videoStarted && needsGesture)) {
+          const paused = videos.find((video) => video.paused) || videos[0];
+          let play = null;
+
+          // Primeiro tenta exatamente o elemento desenhado sobre o centro do
+          // video. O player desta gravacao nao identifica seu botao circular
+          // com aria-label/classe "play", e o centro da janela pode apontar
+          // para outro controle da pagina.
+          if (paused) {
+            const rect = paused.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            const root = paused.getRootNode();
+            const centered = typeof root.elementFromPoint === 'function'
+              ? root.elementFromPoint(x, y)
+              : document.elementFromPoint(x, y);
+            if (centered) {
+              play = typeof centered.closest === 'function'
+                ? centered.closest('button, [role="button"], [class*="play" i]') || centered
+                : centered;
+            }
+          }
+
+          const playCandidates = queryAll([
+            '.vjs-big-play-button', '.plyr__control--overlaid', '.ytp-large-play-button',
+            '.jw-display-icon-container', '.jw-icon-playback',
+            '[class*="play-button" i]', '[data-testid*="play" i]',
+            'button[aria-label*="play" i]', 'button[title*="play" i]',
+            'button[aria-label*="reprodu" i]', 'button[aria-label*="assist" i]'
+          ].join(','));
+          const inChildFrame = window !== window.top;
+          if (!play) {
+            play = playCandidates.find((candidate) => {
+              const rect = candidate.getBoundingClientRect();
+              if (!rect.width || !rect.height) return false;
+              return inChildFrame || Boolean(candidate.closest(
+                '[class*="player" i], [class*="video" i], [data-player], video'
+              ));
+            });
+          }
+          if (!play) {
+            // O player de gravações do Fathom usa apenas um botão circular com
+            // SVG, sem classe/aria-label contendo "play".
+            const centerX = innerWidth / 2;
+            const centerY = innerHeight / 2;
+            play = queryAll('button, [role="button"]')
+              .filter((candidate) => {
+                const rect = candidate.getBoundingClientRect();
+                const text = String(candidate.innerText || candidate.textContent || '').trim();
+                const compact = rect.width >= 28 && rect.height >= 28 &&
+                  rect.width <= 180 && rect.height <= 180;
+                const central = inChildFrame || rect.left > innerWidth * 0.2;
+                return compact && central && text.length <= 20 &&
+                  (candidate.querySelector('svg') || /[▶►]|play|reprodu|assist/i.test(text));
+              })
+              .sort((left, right) => {
+                const a = left.getBoundingClientRect();
+                const b = right.getBoundingClientRect();
+                const da = Math.hypot(a.left + a.width / 2 - centerX, a.top + a.height / 2 - centerY);
+                const db = Math.hypot(b.left + b.width / 2 - centerX, b.top + b.height / 2 - centerY);
+                return da - db;
+              })[0] || null;
+          }
           if (play) {
-            try { play.click(); } catch { /* controle protegido */ }
+            try {
+              playClickTarget = `${play.tagName || 'element'}${play.className ? '.' + String(play.className).split(/\s+/).slice(0, 2).join('.') : ''}`.slice(0, 120);
+              play.scrollIntoView({ block: 'center', inline: 'center' });
+              if (typeof play.focus === 'function') play.focus({ preventScroll: true });
+              const rect = play.getBoundingClientRect();
+              const eventInit = {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2,
+                button: 0,
+                buttons: 1,
+                view: window
+              };
+              if (typeof PointerEvent === 'function') {
+                play.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+                play.dispatchEvent(new PointerEvent('pointerup', { ...eventInit, buttons: 0 }));
+              }
+              play.dispatchEvent(new MouseEvent('mousedown', eventInit));
+              play.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
+              play.click();
+            } catch {
+              /* controle protegido */
+            }
           }
         }
 
         try {
           for (const entry of performance.getEntriesByType('resource')) {
-            if (/\.m3u8(?![a-z0-9])|\.mp4(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(entry.name)) {
+            if (/\.m3u8(?![a-z0-9])|\.mp4(?![a-z0-9])|\.mpd(?![a-z0-9])|\.(?:webm|mkv|mov)(?![a-z0-9])|[?&/=](?:m3u8|mpd)(?![a-z0-9])/i.test(entry.name)) {
               urls.add(entry.name);
             }
           }
@@ -1400,7 +2291,9 @@ async function nudgePlay(tabId, { deep = false } = {}) {
               const url = raw.replace(/[),;\]}]+$/, '');
               if (/\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(url)) {
                 hinted.push({ url, format: 'hls' });
-              } else if (/\.mp4(?![a-z0-9])|[?&]format=mp4/i.test(url)) {
+              } else if (/\.mpd(?![a-z0-9])|[?&/=]mpd(?![a-z0-9])/i.test(url)) {
+                hinted.push({ url, format: 'dash' });
+              } else if (/\.(?:mp4|webm|mkv|mov)(?![a-z0-9])|[?&]format=(?:mp4|webm|mkv|mov)/i.test(url)) {
                 hinted.push({ url, format: 'file' });
               }
             }
@@ -1437,7 +2330,13 @@ async function nudgePlay(tabId, { deep = false } = {}) {
                 if (/^https?:/i.test(raw)) {
                   if (/\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(raw)) {
                     hinted.push({ url: raw, format: 'hls' });
-                  } else if (/\.mp4(?![a-z0-9])|[?&]format=mp4/i.test(raw)) {
+                  } else if (/\.mpd(?![a-z0-9])|[?&/=]mpd(?![a-z0-9])/i.test(raw)) {
+                    hinted.push({ url: raw, format: 'dash' });
+                  } else if (/\.(?:mp4|webm|mkv|mov)(?![a-z0-9])|[?&]format=(?:mp4|webm|mkv|mov)/i.test(raw)) {
+                    hinted.push({ url: raw, format: 'file' });
+                  } else if (/(?:download|recording|video|media|playback|asset).*(?:url|src)/i.test(key)) {
+                    // Fathom costuma guardar a URL assinada sem extensao em
+                    // propriedades como recordingUrl ou download_url.
                     hinted.push({ url: raw, format: 'file' });
                   } else if (/(hls|m3u8|manifest|playlist)/i.test(nextContext)) {
                     hinted.push({ url: raw, format: 'hls' });
@@ -1459,6 +2358,9 @@ async function nudgePlay(tabId, { deep = false } = {}) {
           urls: [...urls].slice(-30),
           hinted,
           videoCount,
+          videoPausedCount: videos.filter((video) => video.paused).length,
+          videoBlobCount: videos.filter((video) => /^(?:blob|mediastream):/i.test(video.currentSrc || video.src || '')).length,
+          playClickTarget,
           iframeCount: iframeHosts.length,
           iframeUrls: iframeUrls.slice(0, 20),
           iframeHosts: [...new Set(iframeHosts)].slice(0, 5),
@@ -1471,7 +2373,7 @@ async function nudgePlay(tabId, { deep = false } = {}) {
     for (const frame of frames) {
       if (frame.result) diagnostics.push(frame.result);
       for (const url of (frame.result && frame.result.urls) || []) {
-        if (M3U8_RE.test(url) || MP4_RE.test(url)) {
+        if (M3U8_RE.test(url) || MP4_RE.test(url) || MPD_RE.test(url) || WEBM_RE.test(url)) {
           await addStream(tabId, url, 'player', null, {
             documentUrl: frame.result.documentUrl
           });
@@ -1522,15 +2424,34 @@ async function pickStream(list, frames = []) {
     return score(right) - score(left) || (left.detectedAt || 0) - (right.detectedAt || 0);
   });
 
-  const hls = candidates.filter((stream) => stream.format !== 'file');
+  const hls = candidates.filter((stream) => stream.format === 'hls');
   let validSingle = null;
+  let headerVerified = null;
   for (const stream of hls) {
+    const confirmedHls = stream.verifiedByHeaders && /mpegurl/i.test(stream.contentType || '');
+    if (confirmedHls && /(?:^|\.)portal\.turingacademy\.com\.br$/i.test(hostOf(stream.url))) {
+      return stream;
+    }
+    if (confirmedHls && !headerVerified) headerVerified = stream;
     const probed = await probeMaster(stream.url);
     if (!playlistMatchesMediaIdentity(stream, probed)) continue;
     if (probed && !probed.error && probed.variants.length) return stream;
     if (probed && !probed.error && probed.single && !validSingle) validSingle = stream;
   }
-  return validSingle || candidates.find((stream) => stream.format === 'file') || null;
+  if (validSingle) return validSingle;
+  // Se o proprio Chrome recebeu Content-Type de playlist enquanto a aula
+  // estava tocando, a URL e real. Uma segunda leitura pelo service worker pode
+  // falhar por SameSite/referrer, mas isso nao deve apagar a deteccao valida.
+  if (headerVerified) return headerVerified;
+  const dash = candidates.find((stream) => stream.format === 'dash');
+  if (dash) return dash;
+  for (const stream of candidates.filter((candidate) => candidate.format === 'file')) {
+    const probed = await probeDirectMedia(stream.url);
+    if (probed.valid) {
+      return { ...stream, url: probed.finalUrl, contentType: probed.contentType };
+    }
+  }
+  return null;
 }
 
 /** Espera a aba revelar uma playlist, dando tempo para as variantes chegarem. */
@@ -1584,10 +2505,11 @@ function lessonIdFromUrl(url) {
 }
 
 function startLessonDebug(tabId, item) {
+  const pageUrl = item.actualUrl || item.url;
   lessonDebugContexts.set(tabId, {
     title: item.title,
-    lessonUrl: item.url,
-    lessonId: lessonIdFromUrl(item.url),
+    lessonUrl: pageUrl,
+    lessonId: lessonIdFromUrl(pageUrl),
     network: [],
     attempts: [],
     videoUrl: null,
@@ -1601,6 +2523,7 @@ function noteLessonDebug(tabId, message) {
 }
 
 async function prepareLessonPageDebug(tabId, item, { reset = false } = {}) {
+  const pageUrl = item.actualUrl || item.url;
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
@@ -1614,8 +2537,8 @@ async function prepareLessonPageDebug(tabId, item, { reset = false } = {}) {
         LESSON_DEBUG_STORE_KEY,
         {
           title: item.title,
-          url: item.url,
-          lessonId: lessonIdFromUrl(item.url),
+          url: pageUrl,
+          lessonId: lessonIdFromUrl(pageUrl),
           identifiers: item.identifiers || null
         },
         reset
@@ -1929,7 +2852,7 @@ function playerTemplateFromRecord(record, frame, valueKeys) {
 function identifiersFromFrames(frames, item) {
   const identifiers = {};
   mergePlayerIdentifiers(identifiers, item?.identifiers);
-  mergePlayerIdentifiers(identifiers, { lessonId: lessonIdFromUrl(item?.url) });
+  mergePlayerIdentifiers(identifiers, { lessonId: lessonIdFromUrl(item?.actualUrl || item?.url) });
   for (const frame of frames) {
     for (const record of frame.records || []) mergePlayerIdentifiers(identifiers, record.identifiers);
     for (const snapshot of frame.snapshots || []) mergePlayerIdentifiers(identifiers, snapshot.identifiers);
@@ -1977,9 +2900,9 @@ async function rememberPlayerFlow(tabId, item) {
   }
   if (!templates.length) return;
   let origin = null;
-  try { origin = new URL(item.url).origin; } catch { /* URL invalida */ }
+  try { origin = new URL(item.actualUrl || item.url).origin; } catch { /* URL invalida */ }
   observedPlayerFlow = {
-    version: 3,
+    version: 4,
     origin,
     learnedAt: Date.now(),
     templates
@@ -1990,12 +2913,12 @@ async function rememberPlayerFlow(tabId, item) {
 
 async function loadObservedPlayerFlow(item) {
   let origin = null;
-  try { origin = new URL(item.url).origin; } catch { return null; }
+  try { origin = new URL(item.actualUrl || item.url).origin; } catch { return null; }
   if (!observedPlayerFlow) {
     const data = await chrome.storage.session.get(MEDIA_RESOLVER_TEMPLATE_KEY).catch(() => ({}));
     observedPlayerFlow = data[MEDIA_RESOLVER_TEMPLATE_KEY] || null;
   }
-  return observedPlayerFlow?.version === 3 && observedPlayerFlow.origin === origin
+  return observedPlayerFlow?.version === 4 && observedPlayerFlow.origin === origin
     ? observedPlayerFlow
     : null;
 }
@@ -2003,13 +2926,22 @@ async function loadObservedPlayerFlow(item) {
 async function addResolvedMediaCandidate(tabId, rawUrl, baseUrl, source) {
   try {
     const url = new URL(rawUrl, baseUrl || undefined).href;
-    if (M3U8_RE.test(url) || MP4_RE.test(url)) {
-      const added = await addStream(tabId, url, source, M3U8_RE.test(url) ? 'hls' : 'file', {
+    if (M3U8_RE.test(url) || MP4_RE.test(url) || MPD_RE.test(url) || WEBM_RE.test(url)) {
+      const format = M3U8_RE.test(url) ? 'hls' : (MPD_RE.test(url) ? 'dash' : 'file');
+      const added = await addStream(tabId, url, source, format, {
         documentUrl: baseUrl || null
       });
-      return { playable: Boolean(added), url };
+      return { playable: Boolean(added), dash: format === 'dash', url };
     }
-    if (MPD_RE.test(url)) return { playable: false, dash: true, url };
+    if (/^https?:/i.test(url)) {
+      const probed = await probeDirectMedia(url);
+      if (probed.valid) {
+        const added = await addStream(tabId, probed.finalUrl, source, 'file', {
+          documentUrl: baseUrl || null
+        });
+        return { playable: Boolean(added), dash: false, url: probed.finalUrl };
+      }
+    }
   } catch {
     /* candidato invalido */
   }
@@ -2042,7 +2974,12 @@ async function resolveLessonMedia(tabId, item, playerFrames = []) {
   })));
 
   for (const rawUrl of mediaCandidatesFromFrames(frames)) {
-    const candidate = await addResolvedMediaCandidate(tabId, rawUrl, item.url, 'media-resolver-state');
+    const candidate = await addResolvedMediaCandidate(
+      tabId,
+      rawUrl,
+      item.actualUrl || item.url,
+      'media-resolver-state'
+    );
     if (candidate.dash) dashManifests.push(candidate.url);
   }
 
@@ -2147,7 +3084,7 @@ async function resolveLessonMedia(tabId, item, playerFrames = []) {
 
   console.log('IDs resolvidos:', foundIds);
   console.log('Operacoes pendentes:', unresolved);
-  console.log('Manifest DASH detectado (downloader atual nao suporta DASH):', dashManifests.map(safeDebugUrl));
+  console.log('Manifest DASH detectado:', dashManifests.map(safeDebugUrl));
   console.log('Manifest/arquivo reproduzivel:', stream ? safeDebugUrl(stream.url) : null);
   console.log('RESULTADO:', stream ? 'STREAM ENCONTRADO' : 'NENHUM STREAM OBTIDO');
   console.groupEnd();
@@ -2341,9 +3278,19 @@ async function runBatchItem(item) {
   clearTab(batch.tabId, { keepEntry: true });
   noteLessonDebug(debugTabId, 'URLs de mídia da aula anterior removidas de tabStreams');
 
-  const navigation = await navigateToLesson(batch.tabId, item.url, item.title);
+  const navigation = await navigateToLesson(
+    batch.tabId,
+    item.url,
+    item.title,
+    { byTitleOnly: item.isBonus }
+  );
   noteLessonDebug(debugTabId, 'navigateToLesson: ' + navigation.method);
   if (!navigation.ok) {
+    if (item.isBonus) {
+      item.status = 'error';
+      item.error = `não encontrei o card do bônus "${item.title}" para abrir`;
+      return;
+    }
     try {
       await chrome.tabs.update(batch.tabId, { url: item.url });
       navigation.method = 'recarregamento';
@@ -2356,8 +3303,23 @@ async function runBatchItem(item) {
   }
   item.navigation = navigation.method;
 
-  let loaded = await waitForTabLoad(batch.tabId, item.url);
-  if (!loaded && navigation.ok && navigation.method !== 'current') {
+  let loaded;
+  if (item.isBonus) {
+    const opened = await waitForOpenedTitle(batch.tabId, item.title);
+    loaded = opened.ok;
+    if (opened.ok) {
+      item.actualUrl = opened.url;
+      const context = lessonDebugContexts.get(debugTabId);
+      if (context) {
+        context.lessonUrl = opened.url;
+        context.lessonId = lessonIdFromUrl(opened.url);
+      }
+      saveBatch();
+    }
+  } else {
+    loaded = await waitForTabLoad(batch.tabId, item.url);
+  }
+  if (!item.isBonus && !loaded && navigation.ok && navigation.method !== 'current') {
     try {
       await chrome.tabs.update(batch.tabId, { url: item.url });
       navigation.method += '+recarregamento';
@@ -2379,7 +3341,9 @@ async function runBatchItem(item) {
     item.status = 'error';
     try {
       const actual = (await chrome.tabs.get(batch.tabId)).url || '';
-      item.error = actual && !sameLessonUrl(actual, item.url)
+      item.error = item.isBonus
+        ? `o card foi clicado, mas o conteúdo "${item.title}" não abriu`
+        : actual && !sameLessonUrl(actual, item.url)
         ? `a aula redirecionou para outra pagina (${actual})`
         : 'a pagina nao terminou de carregar';
     } catch {
@@ -2389,19 +3353,42 @@ async function runBatchItem(item) {
   }
   if (batchCanceled()) return;
 
+  // Bônus de texto/arquivo não devem esperar por um player que a própria
+  // plataforma declarou inexistente.
+  if (item.kind && item.kind !== 'video') {
+    item.phase = 'Lendo texto, links e anexos…';
+    saveBatch();
+    const capture = await capturePageResources(batch.tabId, item.title);
+    const saved = await saveCapturedResources(item, capture);
+    if (saved.ok) {
+      item.status = 'done';
+      item.filename = saved.filename;
+      item.savedPath = saved.savedPath;
+      item.downloadIds = saved.downloadIds;
+      item.error = saved.warnings.length ? saved.warnings.join(' · ') : null;
+      await markCompleted(item.url, { ...saved, validatedBonus: item.isBonus });
+    } else if (saved.canceled) {
+      item.status = 'pending';
+    } else {
+      item.status = 'error';
+      item.error = saved.error;
+    }
+    return;
+  }
+
   item.phase = 'Procurando o video…';
   saveBatch();
   noteLessonDebug(debugTabId, 'nudgePlay deep: video/src, performance entries, JSON, scripts e React props');
   await nudgePlay(batch.tabId, { deep: true });
 
-  const detection = await waitForStream(batch.tabId);
+  const detection = await waitForStream(batch.tabId, item.isBonus ? 45000 : STREAM_TIMEOUT_MS);
   let stream = detection.stream;
   let streamCameFromResolver = false;
   noteLessonDebug(
     debugTabId,
     stream
       ? 'waitForStream encontrou mídia e selecionou uma URL'
-      : 'waitForStream encerrou após 20s sem HLS/MP4; nudge a cada 1s e deep scan a cada 5s'
+      : 'waitForStream encerrou sem HLS/MP4/DASH; nudge a cada 1s e deep scan a cada 5s'
   );
   if (!stream && !batchCanceled()) {
     item.phase = 'MEDIA RESOLVER: consultando APIs...';
@@ -2416,17 +3403,29 @@ async function runBatchItem(item) {
     ];
   }
   if (!stream) {
-    item.status = 'skipped';
     const diagnostics = detection.diagnostics || [];
+    item.status = 'skipped';
     const videos = diagnostics.reduce((sum, frame) => sum + (frame.videoCount || 0), 0);
+    const pausedVideos = diagnostics.reduce((sum, frame) => sum + (frame.videoPausedCount || 0), 0);
+    const blobVideos = diagnostics.reduce((sum, frame) => sum + (frame.videoBlobCount || 0), 0);
     const iframes = diagnostics.reduce((sum, frame) => sum + (frame.iframeCount || 0), 0);
     const hosts = [...new Set(diagnostics.flatMap((frame) => frame.iframeHosts || []))];
+    const network = lessonDebugContexts.get(debugTabId)?.network || [];
+    const mediaNetwork = network.filter((entry) =>
+      entry.type === 'media' || /^(?:video\/|audio\/)|mpegurl|dash\+xml|octet-stream/i.test(entry.contentType || '')
+    );
+    const networkHosts = [...new Set(mediaNetwork.map((entry) => hostOf(entry.url)).filter(Boolean))];
+    const networkTypes = [...new Set(mediaNetwork.map((entry) => entry.contentType).filter(Boolean))];
     item.error = [
       'sem URL de video detectada',
       `${diagnostics.length} frame(s) inspecionado(s)`,
       `${videos} video(s)`,
+      pausedVideos ? `${pausedVideos} pausado(s)` : null,
+      blobVideos ? `${blobVideos} blob/MediaSource` : null,
       `${iframes} iframe(s)`,
       hosts.length ? `player: ${hosts.join(', ')}` : null,
+      networkHosts.length ? `rede: ${networkHosts.slice(0, 3).join(', ')}` : null,
+      networkTypes.length ? `tipo: ${networkTypes.slice(0, 2).join(', ')}` : null,
       `navegacao: ${item.navigation || 'desconhecida'}`
     ].filter(Boolean).join(' · ');
     return;
@@ -2438,6 +3437,69 @@ async function runBatchItem(item) {
 
   item.phase = 'Baixando…';
   saveBatch();
+
+  if (stream.format === 'dash' || item.isBonus) {
+    let nativeStream = stream;
+    let finished = null;
+    let fallbackHls = stream.format === 'hls' ? stream : null;
+    let remaining = [...(tabStreams.get(batch.tabId) || [])];
+    const nativeErrors = [];
+    for (let attempt = 1; attempt <= 5 && nativeStream && !batchCanceled(); attempt++) {
+      item.phase = attempt === 1
+        ? 'Baixando e montando o vídeo…'
+        : `Tentando outra fonte do vídeo (${attempt}/5)…`;
+      saveBatch();
+      finished = await downloadNativeMedia(item, nativeStream.url);
+      if (finished.ok) break;
+      nativeErrors.push(finished.error || 'fonte recusada pelo conversor');
+      remaining = remaining.filter((candidate) => candidate.url !== nativeStream.url);
+      nativeStream = await pickStream(remaining, detection.diagnostics || []);
+      if (nativeStream?.format === 'hls' && !fallbackHls) fallbackHls = nativeStream;
+    }
+
+    if (finished?.ok) {
+      item.status = 'done';
+      item.filename = finished.filename;
+      item.savedPath = finished.savedPath;
+      item.container = finished.container;
+      item.downloadIds = finished.downloadIds;
+      await markCompleted(item.url, { ...finished, validatedBonus: item.isBonus });
+    } else if (!fallbackHls) {
+      item.status = 'error';
+      item.error = nativeErrors.slice(-3).join(' · ') || 'nenhuma fonte de vídeo pôde ser baixada';
+    } else {
+      // HLS ainda tem o montador do navegador como reserva se o FFmpeg falhar.
+      item.phase = 'Tentando o download pelo navegador…';
+      saveBatch();
+      const fallback = await startDownload({
+        tabId: batch.tabId,
+        url: fallbackHls.url,
+        format: fallbackHls.format,
+        baseName: item.path
+      });
+      if (!fallback.ok) {
+        item.status = 'error';
+        item.error = `${nativeErrors.slice(-1)[0] || 'FFmpeg falhou'} · ${fallback.error}`;
+        return;
+      }
+      item.jobId = job.id;
+      saveBatch();
+      const fallbackFinished = await waitForJob(job.id);
+      if (fallbackFinished.status === 'done') {
+        item.status = 'done';
+        item.filename = fallbackFinished.filename;
+        item.savedPath = fallbackFinished.savedPath || null;
+        item.container = fallbackFinished.container || null;
+        await markCompleted(item.url, { ...fallbackFinished, validatedBonus: true });
+      } else if (fallbackFinished.status === 'canceled') {
+        item.status = 'pending';
+      } else {
+        item.status = 'error';
+        item.error = fallbackFinished.error || nativeErrors.slice(-1)[0] || 'o download falhou';
+      }
+    }
+    return;
+  }
 
   const started = await startDownload({
     tabId: batch.tabId,
@@ -2461,7 +3523,7 @@ async function runBatchItem(item) {
     item.filename = finished.filename;
     item.savedPath = finished.savedPath || null;
     item.container = finished.container || null;
-    await markCompleted(item.url, finished);
+    await markCompleted(item.url, { ...finished, validatedBonus: item.isBonus });
   } else if (finished.status === 'canceled') {
     item.status = 'pending'; // fila cancelada: o item volta a fila
   } else {
@@ -2537,7 +3599,7 @@ async function startBatch({ tabId, courseTitle, items }) {
     return { ok: false, error: 'Ha um download avulso em andamento.' };
   }
   if (!items || !items.length) {
-    return { ok: false, error: 'Nenhuma aula selecionada.' };
+    return { ok: false, error: 'Nenhum item selecionado.' };
   }
 
   let returnUrl = null;
@@ -2558,6 +3620,8 @@ async function startBatch({ tabId, courseTitle, items }) {
     items: items.map((item) => ({
       url: item.url,
       title: item.title,
+      kind: ['video', 'text', 'file', 'resource'].includes(item.kind) ? item.kind : null,
+      isBonus: Boolean(item.isBonus),
       identifiers: item.identifiers && typeof item.identifiers === 'object'
         ? Object.fromEntries(
             Object.entries(item.identifiers).filter(([key, value]) =>
@@ -2636,7 +3700,7 @@ async function retryFailed() {
   const primeiro = batch.items.findIndex(
     (item) => item.status === 'pending' || item.status === 'active'
   );
-  if (primeiro < 0) return { ok: false, error: 'Nenhuma aula restante.' };
+  if (primeiro < 0) return { ok: false, error: 'Nenhum item restante.' };
 
   batch.cursor = primeiro;
   batch.status = 'running';
@@ -2816,6 +3880,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       tabStreams.clear();
       persist();
       masterCache.clear();
+      directMediaCache.clear();
       ids.forEach(updateBadge);
       sendResponse({ ok: true });
     });
