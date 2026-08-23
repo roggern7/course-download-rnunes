@@ -234,6 +234,17 @@
         });
         continue;
       }
+      let requestOrigin = null;
+      try { requestOrigin = new URL(url, location.href).origin; } catch { /* URL invalida */ }
+      if (!requestOrigin || requestOrigin !== location.origin) {
+        results.push({
+          operationName: template.operationName,
+          endpoint: redactText(url),
+          status: 'skipped',
+          error: 'Operacao cross-origin nao repetida para evitar desafio de autenticacao'
+        });
+        continue;
+      }
       try {
         const headers = {};
         if (body?.format === 'json') headers['content-type'] = 'application/json';

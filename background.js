@@ -1884,6 +1884,15 @@ function playerTemplateFromRecord(record, frame, valueKeys) {
 
   let frameOrigin = null;
   try { frameOrigin = new URL(frame.documentUrl).origin; } catch { /* frame sem URL */ }
+  let requestOrigin = null;
+  try { requestOrigin = new URL(url).origin; } catch { /* endpoint invalido */ }
+
+  // Nunca repete uma chamada autenticada em outro origin. Os gateways da
+  // Hotmart usam bearer/OIDC na chamada original; como credenciais nao sao
+  // copiadas pelo resolver, repetir a URL pode disparar o prompt HTTP Basic
+  // do navegador em um loop.
+  if (!frameOrigin || requestOrigin !== frameOrigin) return null;
+
   let endpoint = url;
   try {
     const parsed = new URL(url);
@@ -1970,7 +1979,7 @@ async function rememberPlayerFlow(tabId, item) {
   let origin = null;
   try { origin = new URL(item.url).origin; } catch { /* URL invalida */ }
   observedPlayerFlow = {
-    version: 2,
+    version: 3,
     origin,
     learnedAt: Date.now(),
     templates
@@ -1986,7 +1995,7 @@ async function loadObservedPlayerFlow(item) {
     const data = await chrome.storage.session.get(MEDIA_RESOLVER_TEMPLATE_KEY).catch(() => ({}));
     observedPlayerFlow = data[MEDIA_RESOLVER_TEMPLATE_KEY] || null;
   }
-  return observedPlayerFlow?.version === 2 && observedPlayerFlow.origin === origin
+  return observedPlayerFlow?.version === 3 && observedPlayerFlow.origin === origin
     ? observedPlayerFlow
     : null;
 }
