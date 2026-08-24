@@ -3,7 +3,13 @@
   const relevantPage =
     /\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?club\/[^/]+\/products\/[^/]+(?:\/|$)|\/trilhas\/[^/]+(?:\/|$)/i;
   const isFathomFrame = /(?:^|\.)fathom\.video$/i.test(location.hostname);
-  if ((!relevantPage.test(location.pathname) && !isFathomFrame) || window[STORE_KEY]?.version === 5) return;
+  const isCoursePlayerFrame = /(?:^|\.)(?:(?:play|pay|player)\.hotmart\.com|pandavideo\.com\.br)$/i.test(
+    location.hostname
+  );
+  if (
+    (!relevantPage.test(location.pathname) && !isFathomFrame && !isCoursePlayerFrame) ||
+    window[STORE_KEY]?.version === 6
+  ) return;
 
   const RELATED_KEY = /(video|media|recording|download|playback|asset|stream|manifest|player|content|url|source|lesson|locked|available|release|access|\bid\b)/i;
   const SENSITIVE_KEY = /(authorization|cookie|token|secret|password|signature|credential|api[-_]?key)/i;
@@ -97,7 +103,7 @@
   }
 
   const state = {
-    version: 5,
+    version: 6,
     lesson: null,
     records: [],
     inspectPayload,
@@ -190,6 +196,27 @@
     }
     return { mediaUrls: [...new Set(mediaUrls)].slice(0, 20), identifiers };
   };
+
+  // Hotmart Club entrega parte da configuracao ao iframe do player via
+  // postMessage. Registrar essa mensagem permite recuperar o manifesto antes
+  // de ele ser transformado em blob/MediaSource.
+  window.addEventListener('message', (event) => {
+    try {
+      const found = mediaAndIds(event.data);
+      const inspected = inspectPayload(event.data);
+      if (!found.mediaUrls.length && !Object.keys(found.identifiers).length && !inspected.related.length) return;
+      push({
+        transport: 'message',
+        method: 'MESSAGE',
+        url: event.origin || location.origin,
+        status: 'received',
+        ...inspected,
+        ...found
+      });
+    } catch {
+      /* mensagem sem dados estruturados */
+    }
+  }, true);
 
   const encodeBody = (body) => {
     if (!body) return undefined;

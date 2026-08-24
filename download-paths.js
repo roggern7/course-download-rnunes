@@ -47,3 +47,16 @@ export function downloadMatchesLesson(downloadPath, lessonPath, { videoOnly = fa
     return new RegExp(`(?:^|/)${escaped}/`, 'i').test(path);
   });
 }
+
+/**
+ * O caminho da aula termina no nome do arquivo, nao em outra pasta:
+ * Curso/Modulo/01 - Aula.mp4.
+ */
+export function nativeVideoTarget(lessonPath) {
+  const parts = String(lessonPath || '').replace(/\\/g, '/').split('/').filter(Boolean);
+  const lessonName = parts.pop() || 'Video';
+  return {
+    directory: parts.join('/'),
+    filename: `${lessonName}.mp4`
+  };
+}

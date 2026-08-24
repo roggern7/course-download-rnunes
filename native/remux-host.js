@@ -15,21 +15,21 @@
  *   { "action": "find-remuxed", "file": "C:\\...\\aula.ts" }
  *   { "action": "find-course-files", "items": [{ "key": "...", "bases": ["Curso/Modulo/Aula"], "kind": "video" }] }
  *   { "action": "place-in-folder", "file": "C:\\...\\03 - Video.mp4", "folderName": "03 - Video" }
- *   { "action": "download-media", "url": "https://.../manifest.mpd", "marker": "C:\\...\\.destino.tmp", "name": "Video.mp4" }
+ *   { "action": "download-media", "url": "https://.../manifest.mpd", "directory": "Course Downloader RNUNES/Curso/Aula", "name": "Video.mp4" }
  *   { "action": "ping" }
  *
  * Resposta:
  *   { "ok": true, "output": "C:\\...\\aula.mp4", "ms": 1234 }
  *   { "ok": false, "error": "..." }
  *
- * A acao download-media acessa somente a URL recebida e grava o resultado na
- * pasta do marcador criado pelo Chrome. As demais acoes continuam locais.
+ * A acao download-media acessa somente a URL recebida e grava o resultado em
+ * uma pasta relativa validada dentro de Downloads. As demais acoes sao locais.
  */
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 
 const MAX_MESSAGE = 64 * 1024 * 1024;
 const FFMPEG_TIMEOUT_MS = 15 * 60 * 1000;
@@ -159,56 +159,267 @@ function nomeSeguro(raw) {
   return `${cleaned || 'Video'}.mp4`;
 }
 
-function downloadMedia({ url, marker, name, referer }) {
+function hlsAttributes(line) {
+  const attrs = {};
+  const input = String(line || '').replace(/^#EXT-X-STREAM-INF:/i, '');
+  const pattern = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
+  let match;
+  while ((match = pattern.exec(input))) {
+    attrs[match[1].toUpperCase()] = match[2].replace(/^"|"$/g, '');
+  }
+  return attrs;
+}
+
+function hlsDuration(playlistText) {
+  let duration = 0;
+  for (const match of String(playlistText || '').matchAll(/^#EXTINF:([0-9.]+)/gmi)) {
+    duration += Number(match[1]) || 0;
+  }
+  return duration || null;
+}
+
+/** Seleciona a maior resolucao e usa bitrate como desempate. */
+function selectBestHlsVariant(masterText, masterUrl) {
+  const lines = String(masterText || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const variants = [];
+  const audioGroups = new Map();
+  let pending = null;
+  for (const line of lines) {
+    if (/^#EXT-X-MEDIA:/i.test(line)) {
+      const attrs = hlsAttributes(line);
+      if (/^AUDIO$/i.test(attrs.TYPE || '') && attrs['GROUP-ID'] && attrs.URI) {
+        try { audioGroups.set(attrs['GROUP-ID'], new URL(attrs.URI, masterUrl).href); }
+        catch { audioGroups.set(attrs['GROUP-ID'], attrs.URI); }
+      }
+      continue;
+    }
+    if (/^#EXT-X-STREAM-INF:/i.test(line)) {
+      const attrs = hlsAttributes(line);
+      const dimensions = String(attrs.RESOLUTION || '').match(/^(\d+)x(\d+)$/i);
+      pending = {
+        width: dimensions ? Number(dimensions[1]) : 0,
+        height: dimensions ? Number(dimensions[2]) : 0,
+        bandwidth: Number(attrs['AVERAGE-BANDWIDTH'] || attrs.BANDWIDTH || 0)
+      };
+      if (attrs.AUDIO) pending.audioGroup = attrs.AUDIO;
+      continue;
+    }
+    if (!line.startsWith('#') && pending) {
+      try { pending.url = new URL(line, masterUrl).href; }
+      catch { pending.url = line; }
+      variants.push(pending);
+      pending = null;
+    }
+  }
+  if (!variants.length) return null;
+  const best = variants.sort((left, right) => {
+    const area = right.width * right.height - left.width * left.height;
+    return area || right.bandwidth - left.bandwidth;
+  })[0];
+  if (best.audioGroup && audioGroups.has(best.audioGroup)) {
+    best.audioUrl = audioGroups.get(best.audioGroup);
+  }
+  return best;
+}
+
+async function resolveBestHlsInput(url, headers) {
+  if (!/\.m3u8(?:$|[?#])/i.test(url) || typeof fetch !== 'function') {
+    return { url, audioUrl: null, quality: null };
+  }
+  try {
+    const requestHeaders = {
+      'user-agent': headers.userAgent
+    };
+    if (headers.referer) requestHeaders.referer = headers.referer;
+    if (headers.origin) requestHeaders.origin = headers.origin;
+    const response = await fetch(url, { headers: requestHeaders, redirect: 'follow', cache: 'no-store' });
+    if (!response.ok) return { url, audioUrl: null, quality: null };
+    const masterText = await response.text();
+    const best = selectBestHlsVariant(masterText, response.url || url);
+    if (!best?.url) {
+      return { url, audioUrl: null, quality: null, duration: hlsDuration(masterText) };
+    }
+    let duration = null;
+    try {
+      const mediaResponse = await fetch(best.url, {
+        headers: requestHeaders,
+        redirect: 'follow',
+        cache: 'no-store'
+      });
+      if (mediaResponse.ok) duration = hlsDuration(await mediaResponse.text());
+    } catch {
+      /* o FFmpeg ainda pode baixar mesmo sem duracao antecipada */
+    }
+    return {
+      url: best.url,
+      audioUrl: best.audioUrl || null,
+      quality: best.height ? `${best.width}x${best.height}` : `${Math.round(best.bandwidth / 1000)} kbps`,
+      duration
+    };
+  } catch {
+    return { url, audioUrl: null, quality: null };
+  }
+}
+
+function runFfmpegWithProgress(ffmpeg, args, { duration = null, onProgress = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    let progress = {};
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      child.kill();
+      reject(new Error('tempo limite do FFmpeg excedido'));
+    }, MEDIA_TIMEOUT_MS);
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const emit = () => {
+      const micros = Number(progress.out_time_us || progress.out_time_ms || 0);
+      const current = micros > 0 ? micros / 1_000_000 : 0;
+      const percent = duration && current
+        ? Math.max(0, Math.min(100, Math.round((current / duration) * 100)))
+        : null;
+      if (typeof onProgress === 'function') {
+        onProgress({
+          current,
+          duration,
+          percent,
+          bytes: Number(progress.total_size || 0),
+          speed: progress.speed || null
+        });
+      }
+      progress = {};
+    };
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() || '';
+      for (const line of lines) {
+        const separator = line.indexOf('=');
+        if (separator < 0) continue;
+        progress[line.slice(0, separator)] = line.slice(separator + 1);
+        if (line.startsWith('progress=')) emit();
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-4 * 1024 * 1024);
+      if (!duration) {
+        const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+        if (match) duration = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+      }
+    });
+    child.on('error', finish);
+    child.on('close', (code) => {
+      if (code === 0) finish();
+      else {
+        const detail = stderr.trim().split(/\r?\n/).filter(Boolean).pop() || `codigo ${code}`;
+        finish(new Error(detail));
+      }
+    });
+  });
+}
+
+function normalizeMediaHeaders(headers, referer) {
+  const source = headers && typeof headers === 'object' ? headers : {};
+  const userAgent = String(source['user-agent'] || source['User-Agent'] ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36');
+  let safeReferer = String(source.referer || source.Referer || referer || '');
+  let origin = String(source.origin || source.Origin || '');
+  try {
+    const parsed = new URL(safeReferer);
+    if (!/^https?:$/.test(parsed.protocol)) safeReferer = '';
+    else if (!origin) origin = parsed.origin;
+  } catch {
+    safeReferer = '';
+  }
+  try {
+    const parsedOrigin = new URL(origin);
+    origin = /^https?:$/.test(parsedOrigin.protocol) ? parsedOrigin.origin : '';
+  } catch {
+    origin = '';
+  }
+  return { referer: safeReferer, origin, userAgent };
+}
+
+async function downloadMedia(
+  { url, marker, directory: relativeDirectory, name, referer, headers },
+  downloadsRoot = path.join(os.homedir(), 'Downloads'),
+  onProgress = null
+) {
   if (!url || typeof url !== 'string') return { ok: false, error: 'URL de mídia ausente' };
   let parsed;
   try { parsed = new URL(url); } catch { return { ok: false, error: 'URL de mídia inválida' }; }
   if (!/^https?:$/.test(parsed.protocol)) return { ok: false, error: 'protocolo de mídia não permitido' };
-  if (!marker || typeof marker !== 'string') return { ok: false, error: 'arquivo marcador ausente' };
-  if (!fs.existsSync(marker) || !fs.statSync(marker).isFile()) {
-    return { ok: false, error: `arquivo marcador não encontrado: ${marker}` };
+
+  let outputDirectory = null;
+  if (marker && typeof marker === 'string') {
+    if (!fs.existsSync(marker) || !fs.statSync(marker).isFile()) {
+      return { ok: false, error: `arquivo marcador não encontrado: ${marker}` };
+    }
+    outputDirectory = path.dirname(path.resolve(marker));
+  } else {
+    outputDirectory = safeDownloadTarget(downloadsRoot, relativeDirectory);
+    if (!outputDirectory || outputDirectory === path.resolve(downloadsRoot)) {
+      return { ok: false, error: 'pasta relativa de destino inválida' };
+    }
+    try {
+      fs.mkdirSync(outputDirectory, { recursive: true });
+    } catch (error) {
+      return { ok: false, error: `não foi possível criar a pasta do vídeo: ${error.message}` };
+    }
   }
 
   const ffmpeg = findFfmpeg();
   if (!ffmpeg) {
-    try { fs.unlinkSync(marker); } catch { /* marcador sem importância */ }
+    try { if (marker) fs.unlinkSync(marker); } catch { /* marcador sem importância */ }
     return { ok: false, error: 'FFmpeg não encontrado. Instale com: winget install Gyan.FFmpeg' };
   }
 
-  const directory = path.dirname(path.resolve(marker));
   const safeName = nomeSeguro(name);
-  const base = path.join(directory, safeName.replace(/\.mp4$/i, ''));
+  const base = path.join(outputDirectory, safeName.replace(/\.mp4$/i, ''));
   const output = nomeLivre(base);
   const startedAt = Date.now();
-  const inputArgs = [];
-  if (referer && typeof referer === 'string') {
-    try {
-      const parsedReferer = new URL(referer);
-      if (/^https?:$/.test(parsedReferer.protocol)) {
-        inputArgs.push('-headers', `Referer: ${parsedReferer.href}\r\n`);
-      }
-    } catch {
-      /* referer opcional e invalido */
-    }
-  }
+  const requestHeaders = normalizeMediaHeaders(headers, referer);
+  const selectedInput = await resolveBestHlsInput(parsed.href, requestHeaders);
+  const httpArgs = ['-user_agent', requestHeaders.userAgent];
+  const headerLines = [
+    requestHeaders.referer ? `Referer: ${requestHeaders.referer}` : null,
+    requestHeaders.origin ? `Origin: ${requestHeaders.origin}` : null
+  ].filter(Boolean);
+  if (headerLines.length) httpArgs.push('-headers', `${headerLines.join('\r\n')}\r\n`);
 
   try {
-    execFileSync(
+    const inputs = [...httpArgs, '-i', selectedInput.url];
+    if (selectedInput.audioUrl) inputs.push(...httpArgs, '-i', selectedInput.audioUrl);
+    const maps = selectedInput.audioUrl
+      ? ['-map', '0:v:0?', '-map', '1:a:0?']
+      : ['-map', '0:v:0?', '-map', '0:a:0?'];
+    await runFfmpegWithProgress(
       ffmpeg,
-      ['-hide_banner', '-loglevel', 'error', '-y',
-       ...inputArgs,
-       '-i', parsed.href,
-       '-map', '0:v:0?', '-map', '0:a:0?',
+      ['-hide_banner', '-loglevel', 'info', '-y', '-progress', 'pipe:1', '-nostats',
+       ...inputs,
+       ...maps,
        '-c', 'copy', '-movflags', '+faststart',
        output],
-      { timeout: MEDIA_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024 }
+      {
+        duration: selectedInput.duration,
+        onProgress: typeof onProgress === 'function'
+          ? (progress) => onProgress({ ...progress, quality: selectedInput.quality })
+          : null
+      }
     );
   } catch (error) {
     try { if (fs.existsSync(output)) fs.unlinkSync(output); } catch { /* ignora */ }
-    const detail = (error.stderr && error.stderr.toString().trim().split('\n').pop()) || error.message;
-    return { ok: false, error: `ffmpeg não conseguiu baixar o vídeo: ${detail}` };
+    return { ok: false, error: `ffmpeg não conseguiu baixar o vídeo: ${error.message}` };
   } finally {
-    try { if (fs.existsSync(marker)) fs.unlinkSync(marker); } catch { /* marcador sem importância */ }
+    try { if (marker && fs.existsSync(marker)) fs.unlinkSync(marker); } catch { /* marcador sem importância */ }
   }
 
   if (!fs.existsSync(output) || fs.statSync(output).size === 0) {
@@ -220,6 +431,7 @@ function downloadMedia({ url, marker, name, referer }) {
     ms: Date.now() - startedAt,
     bytes: fs.statSync(output).size,
     sourceRemoved: true,
+    quality: selectedInput.quality,
     ffmpeg
   };
 }
@@ -390,7 +602,7 @@ function ler(fd, tamanho) {
   return lido === tamanho ? buffer : null;
 }
 
-function main() {
+async function main() {
   const header = ler(0, 4);
   if (!header) return; // stdin fechou: nada a fazer
 
@@ -416,7 +628,10 @@ function main() {
     return respond(remux(pedido));
   }
   if (pedido.action === 'download-media') {
-    return respond(downloadMedia(pedido));
+    const result = await downloadMedia(pedido, undefined, (progress) => {
+      respond({ type: 'download-progress', ...progress });
+    });
+    return respond({ type: 'download-complete', ...result });
   }
   if (pedido.action === 'exists') {
     return respond(fileExists(pedido.file));
@@ -437,11 +652,17 @@ function main() {
 }
 
 if (require.main === module) {
-  try {
-    main();
-  } catch (erro) {
+  main().catch((erro) => {
     respond({ ok: false, error: `host falhou: ${erro.message}` });
-  }
+  });
 }
 
-module.exports = { findCourseFiles, placeInFolder };
+module.exports = {
+  downloadMedia,
+  findCourseFiles,
+  placeInFolder,
+  safeDownloadTarget,
+  hlsDuration,
+  normalizeMediaHeaders,
+  selectBestHlsVariant
+};

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { downloadMatchesKind, downloadMatchesLesson } from '../download-paths.js';
+import {
+  downloadMatchesKind,
+  downloadMatchesLesson,
+  nativeVideoTarget
+} from '../download-paths.js';
 
 const lesson = 'Course Downloader RNUNES/Agentes De Ia Na Pratica V2/01 - Introducao/01 - Navegue pelas aulas';
 
@@ -39,4 +43,13 @@ test('bonus de texto reconhece arquivo dentro da pasta antiga', () => {
   const txt = 'C:\\Users\\Test User\\Downloads\\Agentes De Ia Na Pratica V2\\11 - Extras da trilha\\02 - Biblioteca de 100 Nichos Lucrativos\\Biblioteca de 100 Nichos Lucrativos.txt';
   assert.equal(downloadMatchesLesson(txt, bonus), true);
   assert.equal(downloadMatchesKind(txt, 'text'), true);
+});
+
+test('salva o video diretamente dentro do modulo', () => {
+  assert.deepEqual(nativeVideoTarget(
+    'Course Downloader RNUNES/MDA Academy/99% dos canais Dark/01 - Aula 0 - Introducao'
+  ), {
+    directory: 'Course Downloader RNUNES/MDA Academy/99% dos canais Dark',
+    filename: '01 - Aula 0 - Introducao.mp4'
+  });
 });

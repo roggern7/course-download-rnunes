@@ -183,12 +183,18 @@ function renderFila(batch, job) {
   } else if (batch.status === 'canceled') {
     activityTitleEl.textContent = `Cancelada · ${c.settled} de ${c.total}`;
     activityEl.dataset.tone = 'idle';
+  } else if (batch.status === 'failed') {
+    activityTitleEl.textContent = `Interrompida · ${c.settled} de ${c.total}`;
+    activityEl.dataset.tone = 'error';
   } else {
     activityTitleEl.textContent = `Fila concluida · ${plural(c.total, 'item', 'itens')}`;
     activityEl.dataset.tone = c.error ? 'warn' : 'ok';
   }
 
-  setBar(c.percent, false);
+  const currentPercent = rodando && atual && Number.isFinite(atual.progressPercent)
+    ? atual.progressPercent
+    : null;
+  setBar(currentPercent === null ? c.percent : currentPercent, false);
 
   // Uma barra so: o andamento da aula atual vira texto, nao uma segunda barra.
   if (rodando && atual) {
@@ -197,8 +203,10 @@ function renderFila(batch, job) {
       if (job.total) detalhes.push(`${Math.round((job.current / job.total) * 100)}%`);
       if (job.receivedBytes) detalhes.push(formatBytes(job.receivedBytes));
       else if (atual.phase) detalhes.push(atual.phase);
-    } else if (atual.phase) {
-      detalhes.push(atual.phase);
+    } else {
+      if (Number.isFinite(atual.progressPercent)) detalhes.push(`${atual.progressPercent}%`);
+      if (atual.receivedBytes) detalhes.push(formatBytes(atual.receivedBytes));
+      if (atual.phase) detalhes.push(atual.phase);
     }
     activityMetaEl.textContent = detalhes.join(' · ');
     activityMetaEl.title = atual.title;
@@ -209,7 +217,13 @@ function renderFila(batch, job) {
 
   if (terminada) {
     const total = `${plural(c.total, 'item', 'itens')}: ${resumoFila(c)}.`;
-    if (c.error || c.skipped) {
+    if (batch.status === 'failed') {
+      const detail = firstFailure ? ` Falha: ${firstFailure.error}.` : '';
+      setNote(
+        `A fila parou nesta aula para nao pular as seguintes.${detail} Use "Tentar novamente" para refazer esta aula.`,
+        'warn'
+      );
+    } else if (c.error || c.skipped) {
       const detail = firstFailure ? ` Primeira falha: ${firstFailure.error}.` : '';
       setNote(`${total}${detail} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
     } else if (c.locked) {
@@ -229,7 +243,9 @@ function renderFila(batch, job) {
   const naoProcessadas = c.pending + c.active;
   const restantes = repetiveis + naoProcessadas;
   batchRetryEl.hidden = !(terminada && restantes);
-  batchRetryEl.textContent = naoProcessadas
+  batchRetryEl.textContent = batch.status === 'failed'
+    ? `Tentar novamente (${repetiveis})`
+    : naoProcessadas
     ? `Continuar (${restantes})`
     : `Tentar novamente (${repetiveis})`;
   activityCloseEl.textContent = terminada ? 'Fechar' : 'Cancelar';

@@ -22,8 +22,14 @@ import {
   downloadMatchesKind,
   downloadMatchesLesson,
   lessonDownloadBases,
+  nativeVideoTarget,
   normalizeDownloadPath
 } from './download-paths.js';
+import {
+  isAuthorizationDownloadError,
+  stopBatchOnItemFailure
+} from './batch-policy.js';
+import { COMPLETION_CONTROL_PATTERN } from './navigation-policy.js';
 
 const STORAGE_KEY = 'streams';
 const MAX_PER_TAB = 200;
@@ -344,7 +350,9 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
   if (existing) {
     if (embedId && mediaId === embedId) existing.boundToEmbed = true;
     if (!existing.documentUrl && context.documentUrl) existing.documentUrl = context.documentUrl;
+    if (!existing.initiator && context.initiator) existing.initiator = context.initiator;
     if (!existing.contentType && context.contentType) existing.contentType = context.contentType;
+    if (context.requestHeaders) existing.requestHeaders = context.requestHeaders;
     if (context.verifiedByHeaders) existing.verifiedByHeaders = true;
     if (existing.type !== type) existing.sources = [...new Set([...(existing.sources || [existing.type]), type])];
     persist();
@@ -366,6 +374,8 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
     provider: mediaId ? 'panda' : null,
     mediaId,
     documentUrl: context.documentUrl || null,
+    initiator: context.initiator || null,
+    requestHeaders: context.requestHeaders || null,
     contentType: context.contentType || null,
     verifiedByHeaders: Boolean(context.verifiedByHeaders),
     boundToEmbed: Boolean(mediaId && embedId && mediaId === embedId),
@@ -415,6 +425,29 @@ chrome.webRequest.onBeforeRequest.addListener(
     });
   },
   { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES }
+);
+
+// Repassa somente contexto publico usado por CDNs contra hotlink. Cookies,
+// Authorization e outros segredos nunca entram no estado da extensao.
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const { tabId, url, type, requestHeaders = [] } = details;
+    if (tabId < 0 || (!M3U8_RE.test(url) && !MPD_RE.test(url) && !MP4_RE.test(url) && !WEBM_RE.test(url))) return;
+    const allowed = new Set(['origin', 'referer', 'user-agent']);
+    const safeHeaders = {};
+    for (const header of requestHeaders) {
+      const name = String(header.name || '').toLowerCase();
+      if (allowed.has(name) && header.value) safeHeaders[name] = header.value;
+    }
+    const format = M3U8_RE.test(url) ? 'hls' : (MPD_RE.test(url) ? 'dash' : 'file');
+    addStream(tabId, url, type, format, {
+      documentUrl: details.documentUrl || null,
+      initiator: details.initiator || null,
+      requestHeaders: safeHeaders
+    });
+  },
+  { urls: ['http://*/*', 'https://*/*'], types: OBSERVED_TYPES },
+  ['requestHeaders', 'extraHeaders']
 );
 
 // Alguns players usam uma URL assinada sem extensao. Nesse caso o cabecalho
@@ -914,6 +947,39 @@ function sendNative(message) {
   });
 }
 
+function sendNativeDownload(message, onProgress) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let port;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+      try { port.disconnect(); } catch { /* porta ja encerrada */ }
+    };
+    try {
+      port = chrome.runtime.connectNative(REMUX_HOST);
+      port.onMessage.addListener((response) => {
+        if (response?.type === 'download-progress') {
+          if (typeof onProgress === 'function') onProgress(response);
+          return;
+        }
+        finish(response || { ok: false, error: 'sem resposta do host' });
+      });
+      port.onDisconnect.addListener(() => {
+        if (settled) return;
+        finish({
+          ok: false,
+          error: chrome.runtime.lastError?.message || 'o host encerrou antes de concluir o download'
+        });
+      });
+      port.postMessage(message);
+    } catch (error) {
+      finish({ ok: false, error: error.message });
+    }
+  });
+}
+
 /**
  * @param {object} target job ou item da fila, com savedPath e container
  * @returns {Promise<boolean>} true se virou .mp4
@@ -957,7 +1023,7 @@ async function nativeFileExists(file) {
  * video em trilhas diferentes. O host nativo entrega a URL ao FFmpeg e grava o
  * MP4 na mesma pasta indicada por um pequeno arquivo marcador do Chrome.
  */
-async function downloadNativeMedia(item, url) {
+async function downloadNativeMedia(item, url, { referer = null, headers = null } = {}) {
   if (remuxHostAvailable === false) {
     return {
       ok: false,
@@ -965,24 +1031,27 @@ async function downloadNativeMedia(item, url) {
     };
   }
 
-  const markerName = `.destino-${Date.now()}.tmp`;
-  const marker = await saveChromeResource(
-    'data:text/plain;charset=utf-8,destino%20temporario',
-    `${item.path}/${markerName}`
-  );
-  if (!marker.ok || !marker.download?.filename) {
-    return { ok: false, error: `não foi possível preparar a pasta do vídeo: ${marker.error || 'caminho indisponível'}` };
-  }
-
-  const response = await sendNative({
+  const target = nativeVideoTarget(item.path);
+  item.progressPercent = 0;
+  item.receivedBytes = 0;
+  const response = await sendNativeDownload({
     action: 'download-media',
     url,
-    marker: marker.download.filename,
-    name: `${sanitizeFilename(item.title, 'Video')}.mp4`,
-    referer: item.actualUrl || item.url || ''
+    directory: target.directory,
+    name: target.filename,
+    referer: referer || item.actualUrl || item.url || '',
+    headers
+  }, (progress) => {
+    if (Number.isFinite(progress.percent)) item.progressPercent = progress.percent;
+    if (Number.isFinite(progress.bytes)) item.receivedBytes = progress.bytes;
+    const details = [];
+    if (progress.quality) details.push(progress.quality);
+    if (!Number.isFinite(progress.percent) && progress.current) details.push(`${Math.floor(progress.current)}s baixados`);
+    if (progress.speed) details.push(progress.speed);
+    item.phase = details.length ? `Baixando · ${details.join(' · ')}` : 'Baixando...';
+    saveBatch();
   });
   if (!response.ok) {
-    try { await chrome.downloads.removeFile(marker.downloadId); } catch { /* o host pode ter removido */ }
     if (/not found|nao encontrado|Specified native messaging host/i.test(response.error || '')) {
       remuxHostAvailable = false;
     }
@@ -1006,9 +1075,12 @@ async function downloadNativeMedia(item, url) {
     filename: String(output).split(/[\\/]/).pop(),
     savedPath: output,
     container: 'mp4',
-    downloadId: marker.downloadId,
-    downloadIds: [marker.downloadId],
+    downloadId: null,
+    downloadIds: [],
     remuxed: true,
+    native: true,
+    quality: response.quality || null,
+    progressPercent: 100,
     exists: true
   };
 }
@@ -1883,9 +1955,10 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle, { byTitleOnly = f
     const [injection] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      args: [lessonUrl, lessonTitle, byTitleOnly],
-      func: async (targetUrl, targetTitle, titleOnly) => {
+      args: [lessonUrl, lessonTitle, byTitleOnly, COMPLETION_CONTROL_PATTERN],
+      func: async (targetUrl, targetTitle, titleOnly, completionControlPattern) => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const completionControlRe = new RegExp(completionControlPattern, 'i');
         const target = new URL(targetUrl, location.href);
         const samePath = (left, right) => {
           const a = left.pathname.split('/').filter(Boolean);
@@ -1925,12 +1998,43 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle, { byTitleOnly = f
             return false;
           }
         };
-        const clickable = (el) => {
+        const isCompletionControl = (el) => {
+          if (!el) return false;
+          if (el.matches?.('input[type="checkbox"], [role="checkbox"], [aria-checked]')) return true;
+          const explicit = [
+            el.getAttribute?.('aria-label'),
+            el.getAttribute?.('title'),
+            el.getAttribute?.('name'),
+            el.getAttribute?.('data-testid'),
+            el.getAttribute?.('data-action')
+          ].filter(Boolean).join(' ');
+          if (completionControlRe.test(explicit)) return true;
+
+          const className = typeof el.className === 'string' ? el.className : '';
+          if (/(?:checkbox|check[-_ ]?circle|circle[-_ ]?check|completion[-_ ]?(?:toggle|check))/i.test(className)) {
+            return true;
+          }
+
+          // Usa o texto apenas em controles pequenos. Um card de navegacao
+          // pode conter um selo "concluida", mas o botao de check costuma ter
+          // somente esse rotulo.
+          const text = clean(el.innerText || el.textContent);
+          return text.length <= 60 && completionControlRe.test(text);
+        };
+        const clickable = (el, exactUrl = false) => {
           if (!el) return null;
-          const semantic = el.closest('a, button, [role="button"]');
-          if (semantic) return semantic;
+          const semantic = el.closest('a, button, [role="button"], [role="link"]');
+          // Um link com a URL exata da aula e evidencia mais forte que classes
+          // visuais como "completed" aplicadas ao card inteiro.
+          if (semantic && exactUrl && semantic.matches('a[href]') && sameTarget(semantic.href)) {
+            return semantic;
+          }
+          if (semantic && !isCompletionControl(semantic)) return semantic;
+
           // Alguns menus React usam <div> clicavel sem role/onclick no HTML.
-          for (let node = el; node && node !== document.documentElement; node = node.parentElement) {
+          const start = semantic?.parentElement || el;
+          for (let node = start; node && node !== document.documentElement; node = node.parentElement) {
+            if (isCompletionControl(node)) continue;
             let names = [];
             try { names = Object.getOwnPropertyNames(node); } catch { continue; }
             for (const name of names) {
@@ -1956,7 +2060,7 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle, { byTitleOnly = f
               'a[href], [data-href], [data-url], [data-link], [data-to], [data-path]'
             )) {
               if (urlAttrs.some((attr) => sameTarget(el.getAttribute(attr)))) {
-                const targetControl = clickable(el);
+                const targetControl = clickable(el, true);
                 if (targetControl) return targetControl;
               }
             }
@@ -1989,7 +2093,7 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle, { byTitleOnly = f
         // acordeao e procura novamente antes de passar ao proximo.
         const controls = [...scope.querySelectorAll(
           '[aria-expanded="false"], button[data-state="closed"], [role="button"][data-state="closed"]'
-        )];
+        )].filter((control) => !isCompletionControl(control));
         for (const control of controls.slice(0, 100)) {
           try { control.click(); } catch { continue; }
           await wait(60);
@@ -2114,8 +2218,23 @@ async function nudgePlay(tabId, { deep = false } = {}) {
     const frames = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       world: 'MAIN',
-      args: [deep],
-      func: async (deepScan) => {
+      args: [deep, COMPLETION_CONTROL_PATTERN],
+      func: async (deepScan, completionControlPattern) => {
+        const completionControlRe = new RegExp(completionControlPattern, 'i');
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const isCompletionControl = (candidate) => {
+          if (!candidate) return false;
+          if (candidate.matches?.('input[type="checkbox"], [role="checkbox"], [aria-checked]')) return true;
+          const evidence = [
+            candidate.getAttribute?.('aria-label'),
+            candidate.getAttribute?.('title'),
+            candidate.getAttribute?.('name'),
+            candidate.getAttribute?.('data-testid'),
+            candidate.getAttribute?.('data-action'),
+            clean(candidate.innerText || candidate.textContent).slice(0, 80)
+          ].filter(Boolean).join(' ');
+          return completionControlRe.test(evidence);
+        };
         const urls = new Set();
         const hinted = [];
         let videoCount = 0;
@@ -2173,11 +2292,13 @@ async function nudgePlay(tabId, { deep = false } = {}) {
         if (!videoCount || (!videoStarted && needsGesture)) {
           const paused = videos.find((video) => video.paused) || videos[0];
           let play = null;
+          const inChildFrame = window !== window.top;
+          const knownPlayerFrame = /(?:^|\.)(?:(?:play|pay|player)\.hotmart\.com|pandavideo\.com\.br|fathom\.video)$/i.test(
+            location.hostname
+          );
 
           // Primeiro tenta exatamente o elemento desenhado sobre o centro do
-          // video. O player desta gravacao nao identifica seu botao circular
-          // com aria-label/classe "play", e o centro da janela pode apontar
-          // para outro controle da pagina.
+          // video. Isso nunca usa a pagina do curso como alvo aproximado.
           if (paused) {
             const rect = paused.getBoundingClientRect();
             const x = rect.left + rect.width / 2;
@@ -2186,10 +2307,11 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             const centered = typeof root.elementFromPoint === 'function'
               ? root.elementFromPoint(x, y)
               : document.elementFromPoint(x, y);
-            if (centered) {
-              play = typeof centered.closest === 'function'
+            if (centered && !isCompletionControl(centered)) {
+              const centeredControl = typeof centered.closest === 'function'
                 ? centered.closest('button, [role="button"], [class*="play" i]') || centered
                 : centered;
+              if (!isCompletionControl(centeredControl)) play = centeredControl;
             }
           }
 
@@ -2198,25 +2320,26 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             '.jw-display-icon-container', '.jw-icon-playback',
             '[class*="play-button" i]', '[data-testid*="play" i]',
             'button[aria-label*="play" i]', 'button[title*="play" i]',
-            'button[aria-label*="reprodu" i]', 'button[aria-label*="assist" i]'
+            'button[aria-label*="reprodu" i]'
           ].join(','));
-          const inChildFrame = window !== window.top;
           if (!play) {
             play = playCandidates.find((candidate) => {
+              if (isCompletionControl(candidate)) return false;
               const rect = candidate.getBoundingClientRect();
               if (!rect.width || !rect.height) return false;
-              return inChildFrame || Boolean(candidate.closest(
+              return (inChildFrame && knownPlayerFrame) || Boolean(candidate.closest(
                 '[class*="player" i], [class*="video" i], [data-player], video'
               ));
             });
           }
-          if (!play) {
+          if (!play && inChildFrame && /(?:^|\.)fathom\.video$/i.test(location.hostname)) {
             // O player de gravações do Fathom usa apenas um botão circular com
             // SVG, sem classe/aria-label contendo "play".
             const centerX = innerWidth / 2;
             const centerY = innerHeight / 2;
             play = queryAll('button, [role="button"]')
               .filter((candidate) => {
+                if (isCompletionControl(candidate)) return false;
                 const rect = candidate.getBoundingClientRect();
                 const text = String(candidate.innerText || candidate.textContent || '').trim();
                 const compact = rect.width >= 28 && rect.height >= 28 &&
@@ -2237,24 +2360,8 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             try {
               playClickTarget = `${play.tagName || 'element'}${play.className ? '.' + String(play.className).split(/\s+/).slice(0, 2).join('.') : ''}`.slice(0, 120);
               play.scrollIntoView({ block: 'center', inline: 'center' });
-              if (typeof play.focus === 'function') play.focus({ preventScroll: true });
-              const rect = play.getBoundingClientRect();
-              const eventInit = {
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-                clientX: rect.left + rect.width / 2,
-                clientY: rect.top + rect.height / 2,
-                button: 0,
-                buttons: 1,
-                view: window
-              };
-              if (typeof PointerEvent === 'function') {
-                play.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-                play.dispatchEvent(new PointerEvent('pointerup', { ...eventInit, buttons: 0 }));
-              }
-              play.dispatchEvent(new MouseEvent('mousedown', eventInit));
-              play.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
+              // Um unico click no controle comprovado evita disparar handlers
+              // vizinhos de conclusao/progresso.
               play.click();
             } catch {
               /* controle protegido */
@@ -2394,6 +2501,37 @@ async function nudgePlay(tabId, { deep = false } = {}) {
   } catch {
     /* pagina sem permissao de injecao */
     return [];
+  }
+}
+
+/**
+ * Recria somente o iframe de video. O novo documento recebe lesson-debug.js
+ * em document_start e revela a requisicao que originalmente criou o blob.
+ */
+async function restartEmbeddedPlayer(tabId) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const playerHost = /(?:^|\.)(?:(?:play|pay|player)\.hotmart\.com|pandavideo\.com\.br|fathom\.video)$/i;
+        const frames = [...document.querySelectorAll('iframe[src]')].filter((iframe) => {
+          try { return playerHost.test(new URL(iframe.src, location.href).hostname); }
+          catch { return false; }
+        });
+        for (const iframe of frames) {
+          const replacement = iframe.cloneNode(true);
+          replacement.setAttribute('data-course-downloader-restarted', 'true');
+          iframe.replaceWith(replacement);
+        }
+        return frames.length;
+      }
+    });
+    const count = Number(injection?.result || 0);
+    if (count) await delay(1200);
+    return count;
+  } catch {
+    return 0;
   }
 }
 
@@ -3381,7 +3519,7 @@ async function runBatchItem(item) {
   noteLessonDebug(debugTabId, 'nudgePlay deep: video/src, performance entries, JSON, scripts e React props');
   await nudgePlay(batch.tabId, { deep: true });
 
-  const detection = await waitForStream(batch.tabId, item.isBonus ? 45000 : STREAM_TIMEOUT_MS);
+  let detection = await waitForStream(batch.tabId, item.isBonus ? 45000 : STREAM_TIMEOUT_MS);
   let stream = detection.stream;
   let streamCameFromResolver = false;
   noteLessonDebug(
@@ -3390,6 +3528,24 @@ async function runBatchItem(item) {
       ? 'waitForStream encontrou mídia e selecionou uma URL'
       : 'waitForStream encerrou sem HLS/MP4/DASH; nudge a cada 1s e deep scan a cada 5s'
   );
+  if (!stream && !batchCanceled()) {
+    item.phase = 'Reiniciando o player para capturar a URL...';
+    saveBatch();
+    const restartedFrames = await restartEmbeddedPlayer(batch.tabId);
+    if (restartedFrames) {
+      noteLessonDebug(debugTabId, `player reiniciado: ${restartedFrames} iframe(s)`);
+      await prepareLessonPageDebug(debugTabId, item);
+      const retriedDetection = await waitForStream(batch.tabId, 20000);
+      detection = {
+        stream: retriedDetection.stream,
+        diagnostics: [
+          ...(detection.diagnostics || []),
+          ...(retriedDetection.diagnostics || [])
+        ]
+      };
+      stream = detection.stream;
+    }
+  }
   if (!stream && !batchCanceled()) {
     item.phase = 'MEDIA RESOLVER: consultando APIs...';
     saveBatch();
@@ -3526,6 +3682,27 @@ async function runBatchItem(item) {
     await markCompleted(item.url, { ...finished, validatedBonus: item.isBonus });
   } else if (finished.status === 'canceled') {
     item.status = 'pending'; // fila cancelada: o item volta a fila
+  } else if (isAuthorizationDownloadError(finished.error)) {
+    // Alguns CDNs aceitam a requisicao feita pelo player, mas recusam a mesma
+    // URL quando ela parte do documento offscreen da extensao. O host nativo
+    // pode repetir o download com o Referer verdadeiro do iframe da aula.
+    item.phase = 'Acesso recusado; tentando novamente pelo conversor...';
+    saveBatch();
+    const nativeFinished = await downloadNativeMedia(item, stream.url, {
+      referer: stream.documentUrl || stream.initiator || item.actualUrl || item.url || '',
+      headers: stream.requestHeaders || null
+    });
+    if (nativeFinished.ok) {
+      item.status = 'done';
+      item.filename = nativeFinished.filename;
+      item.savedPath = nativeFinished.savedPath;
+      item.container = nativeFinished.container;
+      item.downloadIds = nativeFinished.downloadIds;
+      await markCompleted(item.url, { ...nativeFinished, validatedBonus: item.isBonus });
+    } else {
+      item.status = 'error';
+      item.error = `${finished.error} · tentativa com Referer: ${nativeFinished.error}`;
+    }
   } else {
     item.status = 'error';
     item.error = finished.error || 'o download falhou';
@@ -3572,6 +3749,14 @@ async function pumpBatch() {
       }
 
       if (batchCanceled()) break;
+
+      // Nao avanca silenciosamente para a proxima aula. Mantemos o cursor na
+      // falha para que "Tentar novamente" reabra exatamente o mesmo item.
+      if (stopBatchOnItemFailure(batch, item)) {
+        saveBatch();
+        break;
+      }
+
       batch.cursor++;
       saveBatch();
 
