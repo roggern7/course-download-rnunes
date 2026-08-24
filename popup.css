@@ -106,17 +106,6 @@ h1 {
   max-width: 300px;
 }
 
-.simulation {
-  flex: none;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border-soft);
-  color: var(--text-dim);
-  font-size: 12px;
-}
-
 /* ---------------------------------------------------------- botoes */
 
 .btn {
@@ -254,6 +243,123 @@ h1 {
   background: rgba(255, 255, 255, 0.07);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------- progresso detalhado */
+
+.progress-dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.progress-hero,
+.progress-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg-elev);
+  padding: 13px;
+}
+
+.progress-kicker {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.55px;
+  text-transform: uppercase;
+}
+
+.progress-lesson {
+  margin-top: 5px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.progress-main {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.progress-percent {
+  color: #d8b4fe;
+  font-size: 34px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-position {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-wide-bar {
+  height: 7px;
+  margin-top: 11px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #21262d;
+}
+
+.progress-wide-fill {
+  height: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: var(--queue);
+  transition: width 0.25s ease;
+}
+
+.progress-phase {
+  margin-top: 9px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.metric {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  background: var(--bg-sunken);
+}
+
+.metric-label {
+  display: block;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.metric-value {
+  display: block;
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.progress-summary {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.6;
 }
 
 /* ---------------------------------------------------------- atividade */

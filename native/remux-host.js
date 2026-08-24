@@ -267,6 +267,7 @@ function runFfmpegWithProgress(ffmpeg, args, { duration = null, onProgress = nul
     let stdout = '';
     let stderr = '';
     let progress = {};
+    let detectedQuality = null;
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
@@ -292,7 +293,8 @@ function runFfmpegWithProgress(ffmpeg, args, { duration = null, onProgress = nul
           duration,
           percent,
           bytes: Number(progress.total_size || 0),
-          speed: progress.speed || null
+          speed: progress.speed || null,
+          quality: detectedQuality
         });
       }
       progress = {};
@@ -310,6 +312,10 @@ function runFfmpegWithProgress(ffmpeg, args, { duration = null, onProgress = nul
     });
     child.stderr.on('data', (chunk) => {
       stderr = (stderr + chunk.toString()).slice(-4 * 1024 * 1024);
+      if (!detectedQuality) {
+        const resolution = stderr.match(/,\s*(\d{2,5})x(\d{2,5})(?:[\s,])/);
+        if (resolution) detectedQuality = `${resolution[1]}x${resolution[2]}`;
+      }
       if (!duration) {
         const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
         if (match) duration = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
@@ -411,7 +417,10 @@ async function downloadMedia(
       {
         duration: selectedInput.duration,
         onProgress: typeof onProgress === 'function'
-          ? (progress) => onProgress({ ...progress, quality: selectedInput.quality })
+          ? (progress) => onProgress({
+              ...progress,
+              quality: selectedInput.quality || progress.quality
+            })
           : null
       }
     );

@@ -1,10 +1,11 @@
 /**
  * Course Downloader RNUNES - popup
  *
- * Tres visoes:
+ * Quatro visoes:
  *  - Esta aba: playlists detectadas na aba atual (download avulso);
  *  - Curso:    aulas do curso, por modulo (download em lote);
  *  - Todas:    o que foi detectado em cada aba.
+ *  - Progresso: velocidade, qualidade, tamanho e tempo restante.
  *
  * Um unico painel de atividade cobre tanto a fila quanto o download avulso,
  * com uma barra so. A logica de dados vive no service worker; aqui e so vista.
@@ -17,10 +18,10 @@ const $ = (id) => document.getElementById(id);
 const listEl = $('list');
 const tabTitleEl = $('tab-title');
 const clearBtn = $('clear');
-const fakeDateBtn = $('fake-date');
 const segCurrent = $('view-current');
 const segCourse = $('view-course');
 const segAll = $('view-all');
+const segProgress = $('view-progress');
 const countCurrentEl = $('count-current');
 const countCourseEl = $('count-course');
 const countAllEl = $('count-all');
@@ -52,8 +53,7 @@ let view = 'current';
 let currentTab = null;
 let data = { current: [], all: {}, job: null, batch: null, completed: {} };
 let refreshTimer = null;
-let fakeDateEnabled = false;
-let fakeDateBusy = false;
+let transferSample = { key: null, bytes: 0, at: 0, startedAt: 0, rate: 0 };
 
 /** Playlists mestras ja lidas: url -> variantes. */
 const probes = new Map();
@@ -419,6 +419,7 @@ async function startDownload(stream) {
     setNote(response.error, 'error');
   }
   await refresh();
+  if (response?.ok) setView('progress');
 }
 
 /* ------------------------------------------------------------------ *
@@ -670,6 +671,7 @@ async function downloadSelected() {
     setNote(response.error, 'error');
   }
   await refresh();
+  if (response?.ok) setView('progress');
 }
 
 selectAllBtn.addEventListener('click', () => setAllSelected(true));
@@ -725,6 +727,193 @@ function showEmpty(title, hint) {
   listEl.appendChild(box);
 }
 
+function formatRate(bytesPerSecond) {
+  const value = Number(bytesPerSecond || 0);
+  if (!(value > 0)) return 'Aguardando dados...';
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(2)} MB/s`;
+  return `${(value / 1024).toFixed(0)} KB/s`;
+}
+
+function formatRemaining(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value < 0) return 'Calculando...';
+  if (value < 60) return `${Math.max(0, Math.round(value))}s`;
+  const minutes = Math.ceil(value / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours}h ${rest}min` : `${hours}h`;
+}
+
+function addMetric(grid, label, value, title = '') {
+  const metric = document.createElement('div');
+  metric.className = 'metric';
+  const labelEl = document.createElement('span');
+  labelEl.className = 'metric-label';
+  labelEl.textContent = label;
+  const valueEl = document.createElement('span');
+  valueEl.className = 'metric-value';
+  valueEl.textContent = value;
+  valueEl.title = title || value;
+  metric.append(labelEl, valueEl);
+  grid.appendChild(metric);
+}
+
+function progressSnapshot() {
+  const batch = data.batch;
+  const current = batch && batch.items.length
+    ? batch.items[Math.min(batch.cursor, batch.items.length - 1)]
+    : null;
+  const job = data.job;
+  const nativeProgress = current && (
+    Number.isFinite(current.progressPercent) || current.downloadMode === 'FFmpeg'
+  );
+  const jobPercent = job && job.total
+    ? Math.round((job.current / job.total) * 100)
+    : null;
+  let percent = nativeProgress ? current.progressPercent : jobPercent;
+  if (!Number.isFinite(percent)) {
+    percent = current && ['done', 'exists'].includes(current.status) ? 100 : 0;
+  }
+
+  const startedAt = nativeProgress
+    ? current.downloadStartedAt
+    : job?.startedAt;
+  let elapsedSeconds = startedAt
+    ? Math.max(0, (Date.now() - startedAt) / 1000)
+    : 0;
+  const bytes = nativeProgress ? current.receivedBytes : job?.receivedBytes;
+  let bytesPerSecond = nativeProgress
+    ? current.downloadBytesPerSecond
+    : job?.bytesPerSecond;
+  let etaSeconds = nativeProgress ? current.downloadEtaSeconds : job?.etaSeconds;
+
+  const sampleKey = current?.url || job?.id || null;
+  const now = Date.now();
+  if (sampleKey && sampleKey !== transferSample.key) {
+    transferSample = { key: sampleKey, bytes: Number(bytes || 0), at: now, startedAt: now, rate: 0 };
+  } else if (sampleKey && Number(bytes || 0) > transferSample.bytes && now > transferSample.at) {
+    const instantRate = (Number(bytes) - transferSample.bytes) / ((now - transferSample.at) / 1000);
+    transferSample.rate = transferSample.rate
+      ? transferSample.rate * 0.65 + instantRate * 0.35
+      : instantRate;
+    transferSample.bytes = Number(bytes);
+    transferSample.at = now;
+  }
+  if (!(bytesPerSecond > 0) && transferSample.key === sampleKey) {
+    bytesPerSecond = transferSample.rate;
+  }
+  if (!elapsedSeconds && transferSample.key === sampleKey) {
+    elapsedSeconds = Math.max(0, (now - transferSample.startedAt) / 1000);
+  }
+  if (!Number.isFinite(etaSeconds) && percent > 0 && percent < 100 && elapsedSeconds) {
+    etaSeconds = elapsedSeconds * (100 - percent) / percent;
+  }
+
+  const phaseQuality = String(current?.phase || '').match(/\b\d{2,5}x\d{2,5}\b/)?.[0];
+
+  return {
+    batch,
+    current,
+    job,
+    percent: Math.max(0, Math.min(100, Math.round(percent))),
+    title: current?.title || job?.title || 'Nenhum download em andamento',
+    phase: current?.phase || job?.phase || '',
+    bytes: Number(bytes || 0),
+    bytesPerSecond: Number(bytesPerSecond || 0),
+    etaSeconds,
+    elapsedSeconds,
+    quality: current?.downloadQuality || job?.quality || phaseQuality || 'Melhor disponível',
+    mediaDuration: current?.progressDurationSeconds || job?.duration || 0,
+    ffmpegSpeed: current?.ffmpegSpeed || null,
+    mode: nativeProgress ? 'Conversor FFmpeg' : (job ? 'Navegador (HLS)' : 'Aguardando'),
+    active: Boolean(
+      (batch && batch.status === 'running' && current?.status === 'active') ||
+      (!batch && job && job.status === 'running')
+    )
+  };
+}
+
+function renderProgressView() {
+  const snapshot = progressSnapshot();
+  if (!snapshot.batch && !snapshot.job) {
+    return showEmpty(
+      'Nenhum download iniciado',
+      'Quando uma aula estiver baixando, esta aba mostrara velocidade, qualidade e tempo restante.'
+    );
+  }
+
+  const dashboard = document.createElement('section');
+  dashboard.className = 'progress-dashboard';
+
+  const hero = document.createElement('div');
+  hero.className = 'progress-hero';
+  const kicker = document.createElement('p');
+  kicker.className = 'progress-kicker';
+  kicker.textContent = snapshot.active ? 'Baixando agora' : 'Ultima atividade';
+  const lesson = document.createElement('h2');
+  lesson.className = 'progress-lesson';
+  lesson.textContent = snapshot.title;
+  const main = document.createElement('div');
+  main.className = 'progress-main';
+  const percent = document.createElement('strong');
+  percent.className = 'progress-percent';
+  percent.textContent = `${snapshot.percent}%`;
+  const position = document.createElement('span');
+  position.className = 'progress-position';
+  position.textContent = snapshot.batch
+    ? `Aula ${Math.min(snapshot.batch.cursor + 1, snapshot.batch.items.length)} de ${snapshot.batch.items.length}`
+    : 'Download avulso';
+  main.append(percent, position);
+  const bar = document.createElement('div');
+  bar.className = 'progress-wide-bar';
+  bar.setAttribute('role', 'progressbar');
+  bar.setAttribute('aria-valuemin', '0');
+  bar.setAttribute('aria-valuemax', '100');
+  bar.setAttribute('aria-valuenow', String(snapshot.percent));
+  const fill = document.createElement('div');
+  fill.className = 'progress-wide-fill';
+  fill.style.width = `${snapshot.percent}%`;
+  bar.appendChild(fill);
+  const phase = document.createElement('p');
+  phase.className = 'progress-phase';
+  phase.textContent = snapshot.phase || (snapshot.active ? 'Preparando download...' : 'Sem atividade atual.');
+  hero.append(kicker, lesson, main, bar, phase);
+
+  const metricsPanel = document.createElement('div');
+  metricsPanel.className = 'progress-panel metrics-grid';
+  addMetric(metricsPanel, 'Velocidade', snapshot.active ? formatRate(snapshot.bytesPerSecond) : '--');
+  addMetric(metricsPanel, 'Tempo restante', snapshot.active ? formatRemaining(snapshot.etaSeconds) : '--');
+  addMetric(metricsPanel, 'Baixado', formatBytes(snapshot.bytes));
+  addMetric(metricsPanel, 'Qualidade', snapshot.quality);
+  addMetric(metricsPanel, 'Tempo decorrido', formatDuration(snapshot.elapsedSeconds));
+  addMetric(metricsPanel, 'Metodo', snapshot.mode);
+  if (snapshot.mediaDuration) {
+    addMetric(metricsPanel, 'Duracao da aula', formatDuration(snapshot.mediaDuration));
+  }
+  if (snapshot.ffmpegSpeed) {
+    addMetric(metricsPanel, 'Ritmo do FFmpeg', snapshot.ffmpegSpeed);
+  }
+
+  dashboard.append(hero, metricsPanel);
+
+  if (snapshot.batch) {
+    const counts = contarFila(snapshot.batch);
+    const summaryPanel = document.createElement('div');
+    summaryPanel.className = 'progress-panel progress-summary';
+    summaryPanel.textContent = [
+      `Fila: ${counts.settled} de ${counts.total} processadas`,
+      `${counts.done + counts.exists} salvas`,
+      `${counts.pending + counts.active} restantes`,
+      counts.error ? `${counts.error} com erro` : null,
+      counts.skipped ? `${counts.skipped} sem video` : null
+    ].filter(Boolean).join(' · ');
+    dashboard.appendChild(summaryPanel);
+  }
+
+  listEl.appendChild(dashboard);
+}
+
 let lastSignature = null;
 
 async function render(force = false) {
@@ -746,6 +935,14 @@ async function render(force = false) {
     course ? [course.courseTitle, course.modules.map((m) => m.lessons.length)] : null,
     [...openModules].sort(),
     data.batch ? [data.batch.status, data.batch.cursor, data.batch.items.map((i) => i.status)] : null,
+    data.batch ? data.batch.items.map((i) => [
+      i.progressPercent, i.receivedBytes, i.downloadBytesPerSecond,
+      i.downloadEtaSeconds, i.phase, i.downloadQuality, i.ffmpegSpeed
+    ]) : null,
+    data.job ? [
+      data.job.status, data.job.current, data.job.total, data.job.receivedBytes,
+      data.job.bytesPerSecond, data.job.etaSeconds, data.job.phase, data.job.quality
+    ] : null,
     Object.keys(data.completed || {}).sort(),
     data.current.map((s) => s.url),
     allEntries.map(([tabId, list]) => [tabId, list.length])
@@ -756,6 +953,7 @@ async function render(force = false) {
   listEl.replaceChildren();
   courseBarEl.hidden = view !== 'course';
 
+  if (view === 'progress') return renderProgressView();
   if (view === 'course') return renderCourseView();
 
   if (view === 'current') {
@@ -819,7 +1017,9 @@ async function refresh() {
 
 function setView(next) {
   view = next;
-  for (const [seg, name] of [[segCurrent, 'current'], [segCourse, 'course'], [segAll, 'all']]) {
+  for (const [seg, name] of [
+    [segCurrent, 'current'], [segCourse, 'course'], [segAll, 'all'], [segProgress, 'progress']
+  ]) {
     seg.classList.toggle('is-active', next === name);
     seg.setAttribute('aria-selected', String(next === name));
   }
@@ -831,34 +1031,13 @@ function setView(next) {
 segCurrent.addEventListener('click', () => setView('current'));
 segCourse.addEventListener('click', () => setView('course'));
 segAll.addEventListener('click', () => setView('all'));
+segProgress.addEventListener('click', () => setView('progress'));
 
 clearBtn.addEventListener('click', async () => {
   if (view === 'all') await send({ type: 'clear-all' });
   else if (currentTab) await send({ type: 'clear-tab', tabId: currentTab.id });
   probes.clear();
   await refresh();
-});
-
-function renderFakeDate() {
-  fakeDateBtn.textContent = fakeDateEnabled ? 'Fake Date: +7 dias' : 'Fake Date: OFF';
-  fakeDateBtn.setAttribute('aria-pressed', String(fakeDateEnabled));
-  fakeDateBtn.disabled = fakeDateBusy || !currentTab;
-}
-
-fakeDateBtn.addEventListener('click', async () => {
-  if (!currentTab || fakeDateBusy) return;
-  fakeDateBusy = true;
-  renderFakeDate();
-
-  const response = await send({
-    type: 'set-fake-date',
-    tabId: currentTab.id,
-    enabled: !fakeDateEnabled
-  });
-  if (response && response.ok) fakeDateEnabled = response.enabled;
-
-  fakeDateBusy = false;
-  renderFakeDate();
 });
 
 (async function init() {
@@ -868,12 +1047,8 @@ fakeDateBtn.addEventListener('click', async () => {
     : 'Nenhuma aba ativa';
   if (currentTab) tabTitleEl.title = currentTab.title || '';
 
-  const fakeDateState = await chrome.storage.local.get('fakeDateEnabled');
-  fakeDateEnabled = Boolean(fakeDateState.fakeDateEnabled);
-  renderFakeDate();
-
   await refresh();
-  if (batchActive()) setView('course');
+  if (batchActive() || jobRunning()) setView('progress');
 
   refreshTimer = setInterval(refresh, 700);
 })();

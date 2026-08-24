@@ -33,21 +33,10 @@ import { COMPLETION_CONTROL_PATTERN } from './navigation-policy.js';
 
 const STORAGE_KEY = 'streams';
 const MAX_PER_TAB = 200;
-const FAKE_DATE_KEY = 'fakeDateEnabled';
-const FAKE_DATE_SCRIPT_ID = 'fake-date-main';
-const FAKE_DATE_RESCAN_KEY = 'fakeDateRescanTabs';
+const LEGACY_FAKE_DATE_SCRIPT_ID = 'fake-date-main';
 const LESSON_DEBUG_SCRIPT_ID = 'lesson-debug-main';
 const LESSON_DEBUG_STORE_KEY = '__COURSE_DOWNLOADER_LESSON_DEBUG__';
 const MEDIA_RESOLVER_TEMPLATE_KEY = 'mediaResolverTemplate';
-
-const FAKE_DATE_SCRIPT = {
-  id: FAKE_DATE_SCRIPT_ID,
-  matches: ['http://*/*', 'https://*/*'],
-  js: ['fake-date.js'],
-  runAt: 'document_start',
-  world: 'MAIN',
-  persistAcrossSessions: true
-};
 
 const LESSON_DEBUG_SCRIPT = {
   id: LESSON_DEBUG_SCRIPT_ID,
@@ -107,18 +96,6 @@ const PLAYER_ID_KEY_RE = /^(?:lesson|content|video|media|asset|playback)(?:_?id)
 const DEBUG_SECRET_RE = /(authorization|cookie|token|secret|password|signature|credential|api[-_]?key)/i;
 let observedPlayerFlow = null;
 
-async function syncFakeDateScript(enabled) {
-  const registered = await chrome.scripting.getRegisteredContentScripts({
-    ids: [FAKE_DATE_SCRIPT_ID]
-  });
-  if (enabled) {
-    if (registered.length) await chrome.scripting.updateContentScripts([FAKE_DATE_SCRIPT]);
-    else await chrome.scripting.registerContentScripts([FAKE_DATE_SCRIPT]);
-  } else if (registered.length) {
-    await chrome.scripting.unregisterContentScripts({ ids: [FAKE_DATE_SCRIPT_ID] });
-  }
-}
-
 async function syncLessonDebugScript() {
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [LESSON_DEBUG_SCRIPT_ID]
@@ -127,42 +104,20 @@ async function syncLessonDebugScript() {
   else await chrome.scripting.registerContentScripts([LESSON_DEBUG_SCRIPT]);
 }
 
-async function queueFakeDateRescan(tabId) {
-  const data = await chrome.storage.session.get(FAKE_DATE_RESCAN_KEY);
-  const pending = data[FAKE_DATE_RESCAN_KEY] || {};
-  pending[tabId] = true;
-  await chrome.storage.session.set({ [FAKE_DATE_RESCAN_KEY]: pending });
-}
-
-async function consumeFakeDateRescan(tabId) {
-  const data = await chrome.storage.session.get(FAKE_DATE_RESCAN_KEY);
-  const pending = data[FAKE_DATE_RESCAN_KEY] || {};
-  if (!pending[tabId]) return false;
-  delete pending[tabId];
-  await chrome.storage.session.set({ [FAKE_DATE_RESCAN_KEY]: pending });
-  return true;
-}
-
-async function setFakeDate(enabled, tabId) {
-  await chrome.storage.local.set({ [FAKE_DATE_KEY]: enabled });
-  await syncFakeDateScript(enabled);
-
-  if (enabled) {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['fake-date.js'],
-      world: 'MAIN'
-    }).catch(() => {});
+async function removeLegacyFakeDate() {
+  const registered = await chrome.scripting.getRegisteredContentScripts({
+    ids: [LEGACY_FAKE_DATE_SCRIPT_ID]
+  });
+  if (registered.length) {
+    await chrome.scripting.unregisterContentScripts({ ids: [LEGACY_FAKE_DATE_SCRIPT_ID] });
   }
-
-  await queueFakeDateRescan(tabId);
-  await chrome.tabs.reload(tabId);
-  return { ok: true, enabled, reloading: true };
+  await Promise.all([
+    chrome.storage.local.remove('fakeDateEnabled'),
+    chrome.storage.session.remove('fakeDateRescanTabs')
+  ]);
 }
 
-chrome.storage.local.get(FAKE_DATE_KEY)
-  .then((data) => syncFakeDateScript(Boolean(data[FAKE_DATE_KEY])))
-  .catch(() => {});
+removeLegacyFakeDate().catch(() => {});
 syncLessonDebugScript().catch(() => {});
 
 /* ------------------------------------------------------------------ *
@@ -497,13 +452,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       persist();
     }
   });
-});
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status !== 'complete') return;
-  consumeFakeDateRescan(tabId).then((pending) => {
-    if (pending) courseScan(tabId, { force: true });
-  }).catch(() => {});
 });
 
 /* ------------------------------------------------------------------ *
@@ -1034,6 +982,10 @@ async function downloadNativeMedia(item, url, { referer = null, headers = null }
   const target = nativeVideoTarget(item.path);
   item.progressPercent = 0;
   item.receivedBytes = 0;
+  item.downloadMode = 'FFmpeg';
+  item.downloadStartedAt = Date.now();
+  item.downloadBytesPerSecond = 0;
+  item.downloadEtaSeconds = null;
   const response = await sendNativeDownload({
     action: 'download-media',
     url,
@@ -1042,8 +994,30 @@ async function downloadNativeMedia(item, url, { referer = null, headers = null }
     referer: referer || item.actualUrl || item.url || '',
     headers
   }, (progress) => {
+    const now = Date.now();
+    const previousBytes = Number(item.progressSampleBytes ?? item.receivedBytes ?? 0);
+    const previousAt = Number(item.progressSampleAt || 0);
+    if (!item.downloadStartedAt) item.downloadStartedAt = now;
     if (Number.isFinite(progress.percent)) item.progressPercent = progress.percent;
     if (Number.isFinite(progress.bytes)) item.receivedBytes = progress.bytes;
+    if (progress.quality) item.downloadQuality = progress.quality;
+    if (Number.isFinite(progress.current)) item.progressCurrentSeconds = progress.current;
+    if (Number.isFinite(progress.duration)) item.progressDurationSeconds = progress.duration;
+    if (progress.speed) item.ffmpegSpeed = progress.speed;
+    const elapsedSeconds = Math.max(0.001, (now - item.downloadStartedAt) / 1000);
+    if (previousAt && item.receivedBytes > previousBytes && now > previousAt) {
+      const instantRate = (item.receivedBytes - previousBytes) / ((now - previousAt) / 1000);
+      item.downloadBytesPerSecond = item.downloadBytesPerSecond > 0
+        ? item.downloadBytesPerSecond * 0.65 + instantRate * 0.35
+        : instantRate;
+    } else if (!(item.downloadBytesPerSecond > 0) && elapsedSeconds >= 1) {
+      item.downloadBytesPerSecond = item.receivedBytes / elapsedSeconds;
+    }
+    item.progressSampleBytes = item.receivedBytes;
+    item.progressSampleAt = now;
+    item.downloadEtaSeconds = item.progressPercent > 0 && item.progressPercent < 100
+      ? elapsedSeconds * (100 - item.progressPercent) / item.progressPercent
+      : null;
     const details = [];
     if (progress.quality) details.push(progress.quality);
     if (!Number.isFinite(progress.percent) && progress.current) details.push(`${Math.floor(progress.current)}s baixados`);
@@ -1059,6 +1033,8 @@ async function downloadNativeMedia(item, url, { referer = null, headers = null }
   }
 
   remuxHostAvailable = true;
+  item.progressPercent = 100;
+  item.downloadEtaSeconds = 0;
   let output = response.output;
   if (item.isBonus && output) {
     const folderName = String(item.path || '').split('/').filter(Boolean).pop();
@@ -3945,14 +3921,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (type === 'set-fake-date') {
-    setFakeDate(Boolean(message.enabled), message.tabId).then(
-      sendResponse,
-      (error) => sendResponse({ ok: false, error: error.message })
-    );
-    return true;
-  }
-
   if (type === 'start-batch') {
     startBatch(message).then(sendResponse);
     return true;
@@ -4075,7 +4043,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   /* --- relatorios vindos do documento offscreen --- */
 
   if (type === 'job-progress') {
-    Object.assign(adoptJob(message.jobId), message.patch);
+    const activeJob = adoptJob(message.jobId);
+    Object.assign(activeJob, message.patch);
+    const elapsedSeconds = Math.max(0.001, (Date.now() - activeJob.startedAt) / 1000);
+    if (activeJob.receivedBytes > 0) {
+      activeJob.bytesPerSecond = activeJob.receivedBytes / elapsedSeconds;
+    }
+    if (activeJob.total > 0 && activeJob.current > 0 && activeJob.current < activeJob.total) {
+      activeJob.etaSeconds = elapsedSeconds * (activeJob.total - activeJob.current) / activeJob.current;
+    } else {
+      activeJob.etaSeconds = null;
+    }
     return false;
   }
 
