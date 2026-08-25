@@ -175,6 +175,16 @@ function isYoutubeUrl(rawUrl) {
   catch { return false; }
 }
 
+function youtubeVideoId(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const embedded = url.pathname.match(/^\/embed\/([A-Za-z0-9_-]{6,})/i);
+    return embedded?.[1] || url.searchParams.get('v') || '';
+  } catch {
+    return '';
+  }
+}
+
 function nomeLivre(base) {
   let alvo = `${base}.mp4`;
   let n = 1;
@@ -539,8 +549,10 @@ async function downloadMedia(
     const args = [
       '--no-playlist', '--newline', '--no-warnings',
       '--progress-template', 'download:%(progress.downloaded_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s',
-      '--extractor-args', 'youtube:player_client=default,web_embedded',
+      '--extractor-args', 'youtube:player_client=web_embedded',
       '--remote-components', 'ejs:github',
+      '--retries', '5', '--fragment-retries', '5',
+      '--retry-sleep', 'http:3',
       '-S', 'proto:https',
       '-f', 'bestvideo*+bestaudio/best',
       '--merge-output-format', 'mp4', '--remux-video', 'mp4',
@@ -554,7 +566,11 @@ async function downloadMedia(
       await runYtDlpWithProgress(ytDlp, args, onProgress);
     } catch (error) {
       try { if (fs.existsSync(output)) fs.unlinkSync(output); } catch { /* ignora */ }
-      return { ok: false, error: `yt-dlp nao conseguiu baixar o video: ${error.message}` };
+      const videoId = youtubeVideoId(parsed.href);
+      return {
+        ok: false,
+        error: `yt-dlp nao conseguiu baixar o video${videoId ? ` ${videoId}` : ''}: ${error.message}`
+      };
     } finally {
       try { if (marker && fs.existsSync(marker)) fs.unlinkSync(marker); } catch { /* marcador sem importancia */ }
     }
