@@ -30,6 +30,11 @@ import {
   stopBatchOnItemFailure
 } from './batch-policy.js';
 import { COMPLETION_CONTROL_PATTERN } from './navigation-policy.js';
+import {
+  googleVideoKind,
+  isGoogleVideoUrl,
+  selectGoogleVideoPair
+} from './youtube-policy.js';
 
 const STORAGE_KEY = 'streams';
 const MAX_PER_TAB = 200;
@@ -316,6 +321,7 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
   if (list.length >= MAX_PER_TAB) return false;
 
   const resolution = detectResolution(url);
+  const googleKind = googleVideoKind(url);
   const format = formatHint || (M3U8_RE.test(url) ? 'hls' : (MPD_RE.test(url) ? 'dash' : 'file'));
   list.push({
     url,
@@ -331,7 +337,7 @@ async function addStream(tabId, url, type, formatHint = null, context = {}) {
     documentUrl: context.documentUrl || null,
     initiator: context.initiator || null,
     requestHeaders: context.requestHeaders || null,
-    contentType: context.contentType || null,
+    contentType: context.contentType || (googleKind ? `${googleKind}/mp4` : null),
     verifiedByHeaders: Boolean(context.verifiedByHeaders),
     boundToEmbed: Boolean(mediaId && embedId && mediaId === embedId),
     detectedAt: Date.now()
@@ -372,7 +378,8 @@ chrome.webRequest.onBeforeRequest.addListener(
       return;
     }
 
-    if (!M3U8_RE.test(url) && !MP4_RE.test(url) && !MPD_RE.test(url) && !WEBM_RE.test(url)) return;
+    if (!M3U8_RE.test(url) && !MP4_RE.test(url) && !MPD_RE.test(url) &&
+        !WEBM_RE.test(url) && !isGoogleVideoUrl(url)) return;
     const format = M3U8_RE.test(url) ? 'hls' : (MPD_RE.test(url) ? 'dash' : 'file');
     addStream(tabId, url, type, format, {
       documentUrl: details.documentUrl || null,
@@ -387,7 +394,8 @@ chrome.webRequest.onBeforeRequest.addListener(
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     const { tabId, url, type, requestHeaders = [] } = details;
-    if (tabId < 0 || (!M3U8_RE.test(url) && !MPD_RE.test(url) && !MP4_RE.test(url) && !WEBM_RE.test(url))) return;
+    if (tabId < 0 || (!M3U8_RE.test(url) && !MPD_RE.test(url) && !MP4_RE.test(url) &&
+        !WEBM_RE.test(url) && !isGoogleVideoUrl(url))) return;
     const allowed = new Set(['origin', 'referer', 'user-agent']);
     const safeHeaders = {};
     for (const header of requestHeaders) {
@@ -971,7 +979,11 @@ async function nativeFileExists(file) {
  * video em trilhas diferentes. O host nativo entrega a URL ao FFmpeg e grava o
  * MP4 na mesma pasta indicada por um pequeno arquivo marcador do Chrome.
  */
-async function downloadNativeMedia(item, url, { referer = null, headers = null } = {}) {
+async function downloadNativeMedia(
+  item,
+  url,
+  { referer = null, headers = null, audioUrl = null } = {}
+) {
   if (remuxHostAvailable === false) {
     return {
       ok: false,
@@ -989,6 +1001,7 @@ async function downloadNativeMedia(item, url, { referer = null, headers = null }
   const response = await sendNativeDownload({
     action: 'download-media',
     url,
+    audioUrl,
     directory: target.directory,
     name: target.filename,
     referer: referer || item.actualUrl || item.url || '',
@@ -2226,6 +2239,23 @@ async function nudgePlay(tabId, { deep = false } = {}) {
         }
         const queryAll = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
 
+        // O player do YouTube usa faixas adaptativas separadas. Solicitar o
+        // maior nivel faz o proprio player revelar as URLs de video e audio
+        // correspondentes, que depois serao unidas pelo host nativo.
+        if (/(?:^|\.)youtube\.com$/i.test(location.hostname)) {
+          try {
+            const youtubePlayer = document.querySelector('#movie_player');
+            const levels = youtubePlayer?.getAvailableQualityLevels?.() || [];
+            const bestLevel = levels[0];
+            if (bestLevel) {
+              youtubePlayer.setPlaybackQualityRange?.(bestLevel, bestLevel);
+              youtubePlayer.setPlaybackQuality?.(bestLevel);
+            }
+          } catch {
+            /* API interna do player indisponivel; a captura de rede continua */
+          }
+        }
+
         for (const iframe of queryAll('iframe')) {
           try {
             const lazySrc = iframe.getAttribute('data-src') || iframe.getAttribute('data-lazy-src');
@@ -2347,7 +2377,7 @@ async function nudgePlay(tabId, { deep = false } = {}) {
 
         try {
           for (const entry of performance.getEntriesByType('resource')) {
-            if (/\.m3u8(?![a-z0-9])|\.mp4(?![a-z0-9])|\.mpd(?![a-z0-9])|\.(?:webm|mkv|mov)(?![a-z0-9])|[?&/=](?:m3u8|mpd)(?![a-z0-9])/i.test(entry.name)) {
+            if (/\.m3u8(?![a-z0-9])|\.mp4(?![a-z0-9])|\.mpd(?![a-z0-9])|\.(?:webm|mkv|mov)(?![a-z0-9])|[?&/=](?:m3u8|mpd)(?![a-z0-9])|https?:\/\/[^/]*googlevideo\.com\/videoplayback/i.test(entry.name)) {
               urls.add(entry.name);
             }
           }
@@ -2456,9 +2486,11 @@ async function nudgePlay(tabId, { deep = false } = {}) {
     for (const frame of frames) {
       if (frame.result) diagnostics.push(frame.result);
       for (const url of (frame.result && frame.result.urls) || []) {
-        if (M3U8_RE.test(url) || MP4_RE.test(url) || MPD_RE.test(url) || WEBM_RE.test(url)) {
+        if (M3U8_RE.test(url) || MP4_RE.test(url) || MPD_RE.test(url) ||
+            WEBM_RE.test(url) || isGoogleVideoUrl(url)) {
           await addStream(tabId, url, 'player', null, {
-            documentUrl: frame.result.documentUrl
+            documentUrl: frame.result.documentUrl,
+            contentType: googleVideoKind(url) ? `${googleVideoKind(url)}/mp4` : null
           });
         }
       }
@@ -2537,6 +2569,11 @@ async function pickStream(list, frames = []) {
       (/^media-resolver/.test(stream.type || '') ? 20 : 0);
     return score(right) - score(left) || (left.detectedAt || 0) - (right.detectedAt || 0);
   });
+
+  const youtubePair = selectGoogleVideoPair(candidates);
+  // Videos adaptativos do YouTube nao contem audio. A politica retorna null
+  // ate a segunda faixa aparecer, evitando salvar silenciosamente um MP4 mudo.
+  if (youtubePair) return youtubePair;
 
   const hls = candidates.filter((stream) => stream.format === 'hls');
   let validSingle = null;
@@ -3570,7 +3607,7 @@ async function runBatchItem(item) {
   item.phase = 'Baixando…';
   saveBatch();
 
-  if (stream.format === 'dash' || item.isBonus) {
+  if (stream.format === 'dash' || item.isBonus || stream.youtube) {
     let nativeStream = stream;
     let finished = null;
     let fallbackHls = stream.format === 'hls' ? stream : null;
@@ -3581,7 +3618,11 @@ async function runBatchItem(item) {
         ? 'Baixando e montando o vídeo…'
         : `Tentando outra fonte do vídeo (${attempt}/5)…`;
       saveBatch();
-      finished = await downloadNativeMedia(item, nativeStream.url);
+      finished = await downloadNativeMedia(item, nativeStream.url, {
+        audioUrl: nativeStream.audioUrl || null,
+        referer: nativeStream.documentUrl || nativeStream.initiator || item.actualUrl || item.url || '',
+        headers: nativeStream.requestHeaders || null
+      });
       if (finished.ok) break;
       nativeErrors.push(finished.error || 'fonte recusada pelo conversor');
       remaining = remaining.filter((candidate) => candidate.url !== nativeStream.url);

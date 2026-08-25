@@ -15,7 +15,7 @@
  *   { "action": "find-remuxed", "file": "C:\\...\\aula.ts" }
  *   { "action": "find-course-files", "items": [{ "key": "...", "bases": ["Curso/Modulo/Aula"], "kind": "video" }] }
  *   { "action": "place-in-folder", "file": "C:\\...\\03 - Video.mp4", "folderName": "03 - Video" }
- *   { "action": "download-media", "url": "https://.../manifest.mpd", "directory": "Course Downloader RNUNES/Curso/Aula", "name": "Video.mp4" }
+ *   { "action": "download-media", "url": "https://.../manifest.mpd", "audioUrl": "https://.../audio", "directory": "Course Downloader RNUNES/Curso/Aula", "name": "Video.mp4" }
  *   { "action": "ping" }
  *
  * Resposta:
@@ -355,7 +355,7 @@ function normalizeMediaHeaders(headers, referer) {
 }
 
 async function downloadMedia(
-  { url, marker, directory: relativeDirectory, name, referer, headers },
+  { url, audioUrl, marker, directory: relativeDirectory, name, referer, headers },
   downloadsRoot = path.join(os.homedir(), 'Downloads'),
   onProgress = null
 ) {
@@ -394,6 +394,9 @@ async function downloadMedia(
   const startedAt = Date.now();
   const requestHeaders = normalizeMediaHeaders(headers, referer);
   const selectedInput = await resolveBestHlsInput(parsed.href, requestHeaders);
+  const separateAudioUrl = selectedInput.audioUrl || (
+    typeof audioUrl === 'string' && /^https?:\/\//i.test(audioUrl) ? audioUrl : null
+  );
   const httpArgs = ['-user_agent', requestHeaders.userAgent];
   const headerLines = [
     requestHeaders.referer ? `Referer: ${requestHeaders.referer}` : null,
@@ -403,8 +406,8 @@ async function downloadMedia(
 
   try {
     const inputs = [...httpArgs, '-i', selectedInput.url];
-    if (selectedInput.audioUrl) inputs.push(...httpArgs, '-i', selectedInput.audioUrl);
-    const maps = selectedInput.audioUrl
+    if (separateAudioUrl) inputs.push(...httpArgs, '-i', separateAudioUrl);
+    const maps = separateAudioUrl
       ? ['-map', '0:v:0?', '-map', '1:a:0?']
       : ['-map', '0:v:0?', '-map', '0:a:0?'];
     await runFfmpegWithProgress(
