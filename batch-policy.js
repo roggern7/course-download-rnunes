@@ -10,6 +10,13 @@ export function isProtectedMediaError(error) {
   return /playlist criptografada|METHOD=(?:AES-128|SAMPLE-AES)|\bDRM\b/i.test(String(error || ''));
 }
 
+export const EMPTY_LESSON_PATTERN =
+  /^(?:nenhum conte[uú]do ainda(?:\.{3})?|este conte[uú]do ainda est[aá] vazio\.?|no content yet(?:\.{3})?|this content is empty\.?)$/i;
+
+export function isExplicitEmptyLessonText(value) {
+  return EMPTY_LESSON_PATTERN.test(String(value || '').replace(/\s+/g, ' ').trim());
+}
+
 /** Marca a aula protegida e avanca somente um item, sem interromper a fila. */
 export function autoSkipProtectedItem(batch, item, now = Date.now()) {
   if (!batch || item?.status !== 'error' || !isProtectedMediaError(item.error)) return false;

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  extractorUrlFromDiagnostics,
   googleVideoKind,
   isGoogleVideoUrl,
   selectGoogleVideoPair,
@@ -48,4 +49,11 @@ test('recupera a URL do iframe incorporado do YouTube', () => {
     { iframeUrls: ['https://www.youtube.com/embed/abcDEF_1234?rel=0'] }
   ]);
   assert.equal(url, 'https://www.youtube.com/embed/abcDEF_1234?rel=0');
+});
+
+test('recupera URL de outros players incorporados', () => {
+  const url = extractorUrlFromDiagnostics([
+    { iframeUrls: ['about:blank', 'https://player.vimeo.com/video/123456789'] }
+  ]);
+  assert.equal(url, 'https://player.vimeo.com/video/123456789');
 });

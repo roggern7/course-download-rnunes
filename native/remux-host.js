@@ -175,6 +175,16 @@ function isYoutubeUrl(rawUrl) {
   catch { return false; }
 }
 
+function isExtractorPageUrl(rawUrl) {
+  try {
+    return /(?:^|\.)(?:youtube(?:-nocookie)?\.com|player\.vimeo\.com|fast\.wistia\.(?:net|com)|loom\.com|vidyard\.com|iframe\.mediadelivery\.net|pandavideo\.com\.br|fathom\.video|(?:play|pay|player)\.hotmart\.com)$/i.test(
+      new URL(rawUrl).hostname
+    );
+  } catch {
+    return false;
+  }
+}
+
 function youtubeVideoId(rawUrl) {
   try {
     const url = new URL(rawUrl);
@@ -538,19 +548,18 @@ async function downloadMedia(
   const output = nomeLivre(base);
   const startedAt = Date.now();
   const requestHeaders = normalizeMediaHeaders(headers, referer);
-  if (isYoutubeUrl(parsed.href)) {
+  if (isExtractorPageUrl(parsed.href)) {
+    const youtube = isYoutubeUrl(parsed.href);
     const ytDlp = findYtDlp();
     if (!ytDlp) {
       return {
         ok: false,
-        error: 'Esta aula usa YouTube. Instale o yt-dlp com: winget install yt-dlp.yt-dlp'
+        error: 'Esta aula usa um player incorporado. Instale o yt-dlp com: winget install yt-dlp.yt-dlp'
       };
     }
     const args = [
       '--no-playlist', '--newline', '--no-warnings',
       '--progress-template', 'download:%(progress.downloaded_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s',
-      '--extractor-args', 'youtube:player_client=web_embedded',
-      '--remote-components', 'ejs:github',
       '--retries', '5', '--fragment-retries', '5',
       '--retry-sleep', 'http:3',
       '-S', 'proto:https',
@@ -558,6 +567,10 @@ async function downloadMedia(
       '--merge-output-format', 'mp4', '--remux-video', 'mp4',
       '--user-agent', requestHeaders.userAgent
     ];
+    if (youtube) {
+      args.push('--extractor-args', 'youtube:player_client=web_embedded');
+      args.push('--remote-components', 'ejs:github');
+    }
     const deno = findDeno();
     if (deno) args.push('--js-runtimes', `deno:${deno}`);
     if (requestHeaders.referer) args.push('--referer', requestHeaders.referer);

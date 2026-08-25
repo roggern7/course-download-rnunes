@@ -142,7 +142,7 @@ function setBar(percent, indeterminado) {
 
 function contarFila(batch) {
   const counts = {
-    done: 0, exists: 0, skipped: 0, protected: 0, locked: 0,
+    done: 0, exists: 0, skipped: 0, protected: 0, empty: 0, locked: 0,
     error: 0, pending: 0, active: 0
   };
   for (const item of batch.items) {
@@ -150,7 +150,7 @@ function contarFila(batch) {
   }
   counts.total = batch.items.length;
   counts.settled = counts.done + counts.exists + counts.skipped + counts.protected +
-    counts.locked + counts.error;
+    counts.empty + counts.locked + counts.error;
   counts.percent = counts.total ? Math.round((counts.settled / counts.total) * 100) : 0;
   return counts;
 }
@@ -160,6 +160,7 @@ function resumoFila(c) {
   if (c.exists) partes.push(`${c.exists} já salvos`);
   if (c.skipped) partes.push(`${c.skipped} sem video`);
   if (c.protected) partes.push(`${c.protected} protegidas`);
+  if (c.empty) partes.push(`${c.empty} sem conteúdo`);
   if (c.locked) partes.push(`${c.locked} bloqueadas`);
   if (c.error) partes.push(`${c.error} com erro`);
   return partes.join(' · ');
@@ -234,6 +235,8 @@ function renderFila(batch, job) {
       setNote(`${total}${detail} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
     } else if (c.protected) {
       setNote(`${total} As aulas protegidas nao foram baixadas.`, 'warn');
+    } else if (c.empty) {
+      setNote(`${total} As aulas vazias foram ignoradas automaticamente.`, 'warn');
     } else if (c.locked) {
       const detail = firstFailure ? ` ${firstFailure.error}.` : '';
       setNote(`${total}${detail} Reescaneie o curso depois da liberacao.`, 'warn');
@@ -489,6 +492,7 @@ const STATE_LABEL = {
   exists: ['Já salvo', 'state-done'],
   skipped: ['Sem video', 'state-skip'],
   protected: ['Protegida', 'state-skip'],
+  empty: ['Sem conteúdo', 'state-skip'],
   locked: ['Bloqueada', 'state-skip'],
   error: ['Erro', 'state-err']
 };
@@ -923,7 +927,8 @@ function renderProgressView() {
       `${counts.pending + counts.active} restantes`,
       counts.error ? `${counts.error} com erro` : null,
       counts.skipped ? `${counts.skipped} sem video` : null,
-      counts.protected ? `${counts.protected} protegidas` : null
+      counts.protected ? `${counts.protected} protegidas` : null,
+      counts.empty ? `${counts.empty} sem conteúdo` : null
     ].filter(Boolean).join(' · ');
     dashboard.appendChild(summaryPanel);
   }

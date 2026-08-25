@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   autoSkipProtectedItem,
+  isExplicitEmptyLessonText,
   isAuthorizationDownloadError,
   isProtectedMediaError,
   shouldStopBatchAfterItem,
@@ -34,6 +35,14 @@ test('pula automaticamente uma aula protegida e avanca somente uma posicao', () 
   });
   assert.equal(autoSkipProtectedItem(batch, item, 5678), false);
   assert.equal(batch.cursor, 5);
+});
+
+test('reconhece somente avisos explicitos de aula vazia', () => {
+  assert.equal(isExplicitEmptyLessonText('Nenhum conteúdo ainda...'), true);
+  assert.equal(isExplicitEmptyLessonText('Este conteúdo ainda está vazio.'), true);
+  assert.equal(isExplicitEmptyLessonText('No content yet...'), true);
+  assert.equal(isExplicitEmptyLessonText('Procurando o vídeo...'), false);
+  assert.equal(isExplicitEmptyLessonText('sem URL de vídeo detectada'), false);
 });
 
 test('reconhece 401 e 403 como falhas que aceitam fallback com Referer', () => {

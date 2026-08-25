@@ -35,6 +35,27 @@ export function youtubeUrlFromDiagnostics(frames = []) {
   return null;
 }
 
+const EXTRACTOR_PLAYER_HOST_RE = /(?:^|\.)(?:youtube(?:-nocookie)?\.com|player\.vimeo\.com|fast\.wistia\.(?:net|com)|loom\.com|vidyard\.com|iframe\.mediadelivery\.net|pandavideo\.com\.br|fathom\.video|(?:play|pay|player)\.hotmart\.com)$/i;
+
+/** URL de pagina de player que o yt-dlp consegue resolver na melhor qualidade. */
+export function extractorUrlFromDiagnostics(frames = []) {
+  const youtube = youtubeUrlFromDiagnostics(frames);
+  if (youtube) return youtube;
+  for (const frame of frames || []) {
+    for (const rawUrl of frame?.iframeUrls || []) {
+      try {
+        const url = new URL(rawUrl);
+        if (/^https?:$/.test(url.protocol) && EXTRACTOR_PLAYER_HOST_RE.test(url.hostname)) {
+          return url.href;
+        }
+      } catch {
+        /* URL relativa ou vazia */
+      }
+    }
+  }
+  return null;
+}
+
 export function selectGoogleVideoPair(candidates) {
   const videos = candidates
     .filter((stream) => googleVideoKind(stream.url) === 'video')

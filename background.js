@@ -27,12 +27,14 @@ import {
 } from './download-paths.js';
 import {
   autoSkipProtectedItem,
+  EMPTY_LESSON_PATTERN,
   isAuthorizationDownloadError,
   isProtectedMediaError,
   stopBatchOnItemFailure
 } from './batch-policy.js';
 import { COMPLETION_CONTROL_PATTERN } from './navigation-policy.js';
 import {
+  extractorUrlFromDiagnostics,
   googleVideoKind,
   isGoogleVideoUrl,
   selectGoogleVideoPair,
@@ -2211,6 +2213,34 @@ async function detectLessonLock(tabId, lessonTitle) {
   }
 }
 
+/** Reconhece apenas o estado vazio declarado pela propria plataforma. */
+async function detectEmptyLesson(tabId) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [EMPTY_LESSON_PATTERN.source, EMPTY_LESSON_PATTERN.flags],
+      func: (pattern, flags) => {
+        const emptyRe = new RegExp(pattern, flags);
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const visible = (el) => {
+          const style = getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' &&
+            Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+        };
+        for (const el of document.querySelectorAll('h1, h2, h3, h4, p, [role="status"], [class*="empty" i]')) {
+          const text = clean(el.innerText || el.textContent);
+          if (emptyRe.test(text) && visible(el)) return text;
+        }
+        return null;
+      }
+    });
+    return injection?.result || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Alguns players so pedem a playlist quando o video comeca. Isso apenas aciona
  * play() no elemento de video ja presente na pagina - nao contorna login,
@@ -2240,6 +2270,7 @@ async function nudgePlay(tabId, { deep = false } = {}) {
         };
         const urls = new Set();
         const hinted = [];
+        const embedUrls = new Set();
         let videoCount = 0;
         let videoStarted = false;
         let needsGesture = false;
@@ -2272,8 +2303,23 @@ async function nudgePlay(tabId, { deep = false } = {}) {
 
         for (const iframe of queryAll('iframe')) {
           try {
-            const lazySrc = iframe.getAttribute('data-src') || iframe.getAttribute('data-lazy-src');
-            if (!iframe.src && lazySrc) iframe.src = lazySrc;
+            const lazySrc = iframe.getAttribute('data-src') ||
+              iframe.getAttribute('data-lazy-src') ||
+              iframe.getAttribute('data-url') ||
+              iframe.getAttribute('data-embed-url');
+            const declaredSrc = iframe.getAttribute('src') || '';
+            if ((!declaredSrc || /^about:blank$/i.test(declaredSrc)) && lazySrc) iframe.src = lazySrc;
+            for (const raw of [iframe.getAttribute('src'), lazySrc]) {
+              if (!raw) continue;
+              const resolved = new URL(raw, location.href);
+              if (/^https?:$/.test(resolved.protocol)) embedUrls.add(resolved.href);
+            }
+            for (const attribute of iframe.attributes || []) {
+              const raw = String(attribute.value || '').trim();
+              if (!raw || !/(?:src|url|embed|player)/i.test(attribute.name)) continue;
+              const resolved = new URL(raw, location.href);
+              if (/^https?:$/.test(resolved.protocol)) embedUrls.add(resolved.href);
+            }
             iframe.scrollIntoView({ block: 'center', inline: 'nearest' });
           } catch {
             /* iframe protegido */
@@ -2416,6 +2462,12 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             const matches = text.match(/https?:[^\s"'<>\\]+/gi) || [];
             for (const raw of matches.slice(0, 200)) {
               const url = raw.replace(/[),;\]}]+$/, '');
+              try {
+                const host = new URL(url).hostname;
+                if (/(?:^|\.)(?:youtube(?:-nocookie)?\.com|player\.vimeo\.com|fast\.wistia\.(?:net|com)|loom\.com|vidyard\.com|iframe\.mediadelivery\.net|pandavideo\.com\.br|fathom\.video|(?:play|pay|player)\.hotmart\.com)$/i.test(host)) {
+                  embedUrls.add(url);
+                }
+              } catch { /* URL incompleta */ }
               if (/\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(url)) {
                 hinted.push({ url, format: 'hls' });
               } else if (/\.mpd(?![a-z0-9])|[?&/=]mpd(?![a-z0-9])/i.test(url)) {
@@ -2455,6 +2507,9 @@ async function nudgePlay(tabId, { deep = false } = {}) {
               if (typeof child === 'string') {
                 const raw = child.replace(/\\u0026/gi, '&').replace(/\\\//g, '/');
                 if (/^https?:/i.test(raw)) {
+                  if (/(?:iframe|embed|player).*(?:url|src)|(?:url|src).*(?:iframe|embed|player)/i.test(nextContext)) {
+                    embedUrls.add(raw);
+                  }
                   if (/\.m3u8(?![a-z0-9])|[?&/=]m3u8(?![a-z0-9])/i.test(raw)) {
                     hinted.push({ url: raw, format: 'hls' });
                   } else if (/\.mpd(?![a-z0-9])|[?&/=]mpd(?![a-z0-9])/i.test(raw)) {
@@ -2476,7 +2531,7 @@ async function nudgePlay(tabId, { deep = false } = {}) {
             }
           }
         }
-        const iframeUrls = queryAll('iframe[src]').map((iframe) => iframe.src).filter(Boolean);
+        const iframeUrls = [...embedUrls];
         const iframeHosts = iframeUrls.map((src) => {
           try { return new URL(src).hostname; } catch { return 'iframe'; }
         });
@@ -3518,6 +3573,16 @@ async function runBatchItem(item) {
   }
   if (batchCanceled()) return;
 
+  const emptyReason = await detectEmptyLesson(batch.tabId);
+  if (emptyReason) {
+    item.status = 'empty';
+    item.emptyReason = emptyReason;
+    item.phase = null;
+    item.skippedAt = Date.now();
+    noteLessonDebug(debugTabId, `aula vazia declarada pela plataforma: ${emptyReason}`);
+    return;
+  }
+
   // Bônus de texto/arquivo não devem esperar por um player que a própria
   // plataforma declarou inexistente.
   if (item.kind && item.kind !== 'video') {
@@ -3556,15 +3621,16 @@ async function runBatchItem(item) {
       : 'waitForStream encerrou sem HLS/MP4/DASH; nudge a cada 1s e deep scan a cada 5s'
   );
   if (!stream) {
-    const youtubeUrl = youtubeUrlFromDiagnostics(detection.diagnostics || []);
-    if (youtubeUrl) {
+    const extractorUrl = extractorUrlFromDiagnostics(detection.diagnostics || []);
+    if (extractorUrl) {
       stream = {
-        url: youtubeUrl,
-        format: 'youtube',
-        youtube: true,
-        documentUrl: youtubeUrl
+        url: extractorUrl,
+        format: 'extractor',
+        extractor: true,
+        youtube: /(?:^|\.)youtube(?:-nocookie)?\.com$/i.test(new URL(extractorUrl).hostname),
+        documentUrl: extractorUrl
       };
-      noteLessonDebug(debugTabId, `player YouTube detectado: ${youtubeUrl}`);
+      noteLessonDebug(debugTabId, `pagina do player detectada: ${extractorUrl}`);
     }
   }
   if (!stream && !batchCanceled()) {
@@ -3633,7 +3699,7 @@ async function runBatchItem(item) {
   item.phase = 'Baixando…';
   saveBatch();
 
-  if (stream.format === 'dash' || item.isBonus || stream.youtube) {
+  if (stream.format === 'dash' || item.isBonus || stream.extractor || stream.youtube) {
     let nativeStream = stream;
     let finished = null;
     let fallbackHls = stream.format === 'hls' ? stream : null;
