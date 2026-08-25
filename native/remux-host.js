@@ -140,6 +140,36 @@ function findYtDlp() {
   return null;
 }
 
+function findDeno() {
+  const candidatos = [];
+  const exts = (process.env.PATHEXT || '.EXE').split(';');
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) candidatos.push(path.join(dir, `deno${ext.toLowerCase()}`));
+  }
+  const local = process.env.LOCALAPPDATA;
+  if (local) {
+    const raiz = path.join(local, 'Microsoft', 'WinGet', 'Packages');
+    try {
+      for (const pasta of fs.readdirSync(raiz)) {
+        if (!/DenoLand\.Deno/i.test(pasta)) continue;
+        const direto = path.join(raiz, pasta, 'deno.exe');
+        candidatos.push(direto);
+      }
+    } catch {
+      /* winget nao usado */
+    }
+  }
+  for (const candidato of candidatos) {
+    try {
+      if (fs.existsSync(candidato) && fs.statSync(candidato).isFile()) return candidato;
+    } catch {
+      /* caminho invalido */
+    }
+  }
+  return null;
+}
+
 function isYoutubeUrl(rawUrl) {
   try { return /(?:^|\.)youtube(?:-nocookie)?\.com$/i.test(new URL(rawUrl).hostname); }
   catch { return false; }
@@ -509,10 +539,15 @@ async function downloadMedia(
     const args = [
       '--no-playlist', '--newline', '--no-warnings',
       '--progress-template', 'download:%(progress.downloaded_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s',
+      '--extractor-args', 'youtube:player_client=default,web_embedded',
+      '--remote-components', 'ejs:github',
+      '-S', 'proto:https',
       '-f', 'bestvideo*+bestaudio/best',
       '--merge-output-format', 'mp4', '--remux-video', 'mp4',
       '--user-agent', requestHeaders.userAgent
     ];
+    const deno = findDeno();
+    if (deno) args.push('--js-runtimes', `deno:${deno}`);
     if (requestHeaders.referer) args.push('--referer', requestHeaders.referer);
     args.push('-o', output, parsed.href);
     try {
@@ -778,7 +813,13 @@ async function main() {
   }
 
   if (pedido.action === 'ping') {
-    return respond({ ok: true, pong: true, ffmpeg: findFfmpeg(), ytDlp: findYtDlp() });
+    return respond({
+      ok: true,
+      pong: true,
+      ffmpeg: findFfmpeg(),
+      ytDlp: findYtDlp(),
+      deno: findDeno()
+    });
   }
   if (pedido.action === 'remux') {
     return respond(remux(pedido));
@@ -819,6 +860,7 @@ module.exports = {
   placeInFolder,
   safeDownloadTarget,
   hlsDuration,
+  findDeno,
   findYtDlp,
   normalizeMediaHeaders,
   selectBestHlsVariant
