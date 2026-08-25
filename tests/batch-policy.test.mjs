@@ -2,16 +2,38 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  autoSkipProtectedItem,
   isAuthorizationDownloadError,
   isProtectedMediaError,
   shouldStopBatchAfterItem,
   stopBatchOnItemFailure
 } from '../batch-policy.js';
 
-test('reconhece playlist protegida que pode ser ignorada manualmente', () => {
+test('reconhece playlist protegida que deve ser ignorada automaticamente', () => {
   assert.equal(isProtectedMediaError('Playlist criptografada (METHOD=AES-128).'), true);
   assert.equal(isProtectedMediaError('Playlist criptografada (METHOD=SAMPLE-AES).'), true);
   assert.equal(isProtectedMediaError('HTTP 403 em master.m3u8'), false);
+});
+
+test('pula automaticamente uma aula protegida e avanca somente uma posicao', () => {
+  const batch = { status: 'running', cursor: 4 };
+  const item = {
+    status: 'error',
+    phase: 'Baixando',
+    error: 'Playlist criptografada (METHOD=AES-128).'
+  };
+
+  assert.equal(autoSkipProtectedItem(batch, item, 1234), true);
+  assert.equal(batch.cursor, 5);
+  assert.deepEqual(item, {
+    status: 'protected',
+    phase: null,
+    error: 'Playlist criptografada (METHOD=AES-128).',
+    protectedReason: 'Playlist criptografada (METHOD=AES-128).',
+    skippedAt: 1234
+  });
+  assert.equal(autoSkipProtectedItem(batch, item, 5678), false);
+  assert.equal(batch.cursor, 5);
 });
 
 test('reconhece 401 e 403 como falhas que aceitam fallback com Referer', () => {

@@ -5,9 +5,20 @@ export function isAuthorizationDownloadError(error) {
   return /\bHTTP\s+(?:401|403)\b/i.test(String(error || ''));
 }
 
-/** Conteudo protegido nao deve ser refeito em loop; pode ser ignorado manualmente. */
+/** Conteudo protegido nao deve ser refeito em loop. */
 export function isProtectedMediaError(error) {
   return /playlist criptografada|METHOD=(?:AES-128|SAMPLE-AES)|\bDRM\b/i.test(String(error || ''));
+}
+
+/** Marca a aula protegida e avanca somente um item, sem interromper a fila. */
+export function autoSkipProtectedItem(batch, item, now = Date.now()) {
+  if (!batch || item?.status !== 'error' || !isProtectedMediaError(item.error)) return false;
+  item.status = 'protected';
+  item.protectedReason = item.error;
+  item.phase = null;
+  item.skippedAt = now;
+  batch.cursor++;
+  return true;
 }
 
 /** Uma falha real nunca deve fazer o cursor consumir a aula seguinte. */

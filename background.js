@@ -26,6 +26,7 @@ import {
   normalizeDownloadPath
 } from './download-paths.js';
 import {
+  autoSkipProtectedItem,
   isAuthorizationDownloadError,
   isProtectedMediaError,
   stopBatchOnItemFailure
@@ -3792,6 +3793,14 @@ async function pumpBatch() {
 
       if (batchCanceled()) break;
 
+      // Criptografia/DRM e uma limitacao definitiva desta aula. Registra a
+      // protecao e segue automaticamente; erros recuperaveis continuam
+      // parando no item exato para permitir nova tentativa.
+      if (autoSkipProtectedItem(batch, item)) {
+        saveBatch();
+        continue;
+      }
+
       // Nao avanca silenciosamente para a proxima aula. Mantemos o cursor na
       // falha para que "Tentar novamente" reabra exatamente o mesmo item.
       if (stopBatchOnItemFailure(batch, item)) {
@@ -3950,11 +3959,9 @@ async function skipProtectedAndContinue() {
     return { ok: false, error: 'A falha atual nao e uma midia protegida.' };
   }
 
-  item.status = 'protected';
-  item.protectedReason = item.error;
-  item.phase = null;
-  item.skippedAt = Date.now();
-  batch.cursor++;
+  if (!autoSkipProtectedItem(batch, item)) {
+    return { ok: false, error: 'Nao foi possivel ignorar a midia protegida.' };
+  }
   batch.status = 'running';
   delete batch.finishedAt;
   saveBatch();
