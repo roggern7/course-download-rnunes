@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import {
   googleVideoKind,
   isGoogleVideoUrl,
-  selectGoogleVideoPair
+  selectGoogleVideoPair,
+  youtubeUrlFromDiagnostics
 } from '../youtube-policy.js';
 
 const google = (kind, itag, size = '') =>
@@ -40,4 +41,11 @@ test('aceita formato progressivo que ja contem audio', () => {
     { url: google('video', '22', '1280x720'), height: 720 }
   ]);
   assert.equal(selected.audioUrl, null);
+});
+
+test('recupera a URL do iframe incorporado do YouTube', () => {
+  const url = youtubeUrlFromDiagnostics([
+    { iframeUrls: ['https://www.youtube.com/embed/abcDEF_1234?rel=0'] }
+  ]);
+  assert.equal(url, 'https://www.youtube.com/embed/abcDEF_1234?rel=0');
 });

@@ -19,6 +19,22 @@ export function isGoogleVideoUrl(rawUrl) {
   catch { return false; }
 }
 
+export function youtubeUrlFromDiagnostics(frames = []) {
+  for (const frame of frames || []) {
+    for (const rawUrl of frame?.iframeUrls || []) {
+      try {
+        const url = new URL(rawUrl);
+        if (!/(?:^|\.)youtube(?:-nocookie)?\.com$/i.test(url.hostname)) continue;
+        if (/^\/embed\/[A-Za-z0-9_-]{6,}/i.test(url.pathname)) return url.href;
+        if (/^\/watch$/i.test(url.pathname) && url.searchParams.get('v')) return url.href;
+      } catch {
+        /* iframe sem URL absoluta */
+      }
+    }
+  }
+  return null;
+}
+
 export function selectGoogleVideoPair(candidates) {
   const videos = candidates
     .filter((stream) => googleVideoKind(stream.url) === 'video')

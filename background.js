@@ -33,7 +33,8 @@ import { COMPLETION_CONTROL_PATTERN } from './navigation-policy.js';
 import {
   googleVideoKind,
   isGoogleVideoUrl,
-  selectGoogleVideoPair
+  selectGoogleVideoPair,
+  youtubeUrlFromDiagnostics
 } from './youtube-policy.js';
 
 const STORAGE_KEY = 'streams';
@@ -1028,7 +1029,9 @@ async function downloadNativeMedia(
     }
     item.progressSampleBytes = item.receivedBytes;
     item.progressSampleAt = now;
-    item.downloadEtaSeconds = item.progressPercent > 0 && item.progressPercent < 100
+    item.downloadEtaSeconds = Number.isFinite(progress.eta)
+      ? progress.eta
+      : item.progressPercent > 0 && item.progressPercent < 100
       ? elapsedSeconds * (100 - item.progressPercent) / item.progressPercent
       : null;
     const details = [];
@@ -3541,6 +3544,18 @@ async function runBatchItem(item) {
       ? 'waitForStream encontrou mídia e selecionou uma URL'
       : 'waitForStream encerrou sem HLS/MP4/DASH; nudge a cada 1s e deep scan a cada 5s'
   );
+  if (!stream) {
+    const youtubeUrl = youtubeUrlFromDiagnostics(detection.diagnostics || []);
+    if (youtubeUrl) {
+      stream = {
+        url: youtubeUrl,
+        format: 'youtube',
+        youtube: true,
+        documentUrl: youtubeUrl
+      };
+      noteLessonDebug(debugTabId, `player YouTube detectado: ${youtubeUrl}`);
+    }
+  }
   if (!stream && !batchCanceled()) {
     item.phase = 'Reiniciando o player para capturar a URL...';
     saveBatch();

@@ -9,9 +9,10 @@
   Sem este passo a extensao continua funcionando igual: salva .ts e mostra a
   dica do remux manual. Isto e opcional.
 
-  Requisitos: Node.js e FFmpeg no PATH.
+  Requisitos: Node.js e FFmpeg no PATH. Para aulas do YouTube, yt-dlp.
     winget install OpenJS.NodeJS.LTS
     winget install Gyan.FFmpeg
+    winget install yt-dlp.yt-dlp
 
 .PARAMETER ExtensionId
   ID da extensao em chrome://extensions. Se omitido, tenta descobrir sozinho
@@ -70,6 +71,14 @@ if ($ffmpeg) {
   Write-Host "FFmpeg  : NAO encontrado no PATH" -ForegroundColor Yellow
   Write-Host "          instale com: winget install Gyan.FFmpeg" -ForegroundColor Yellow
   Write-Host "          (o host tambem procura na pasta do winget em tempo de execucao)"
+}
+
+$ytDlp = Get-Command yt-dlp -ErrorAction SilentlyContinue
+if ($ytDlp) {
+  Write-Host "yt-dlp  : $($ytDlp.Source)"
+} else {
+  Write-Host "yt-dlp  : NAO encontrado (necessario apenas para aulas do YouTube)" -ForegroundColor Yellow
+  Write-Host "          instale com: winget install yt-dlp.yt-dlp" -ForegroundColor Yellow
 }
 
 if (-not (Test-Path -LiteralPath $HostBat)) {

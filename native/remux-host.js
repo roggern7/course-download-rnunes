@@ -93,6 +93,58 @@ function findFfmpeg() {
   return null;
 }
 
+/** Procura o yt-dlp usado somente por aulas incorporadas do YouTube. */
+function findYtDlp() {
+  const candidatos = [];
+  if (process.env.COURSE_DOWNLOADER_YTDLP) candidatos.push(process.env.COURSE_DOWNLOADER_YTDLP);
+  const exts = (process.env.PATHEXT || '.EXE').split(';');
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) candidatos.push(path.join(dir, `yt-dlp${ext.toLowerCase()}`));
+  }
+  const local = process.env.LOCALAPPDATA;
+  if (local) {
+    const raiz = path.join(local, 'Microsoft', 'WinGet', 'Packages');
+    try {
+      const pastas = fs.readdirSync(raiz).sort((left, right) => {
+        const leftMain = /yt-dlp\.yt-dlp/i.test(left) ? 1 : 0;
+        const rightMain = /yt-dlp\.yt-dlp/i.test(right) ? 1 : 0;
+        return rightMain - leftMain;
+      });
+      for (const pasta of pastas) {
+        if (!/yt[-_.]?dlp/i.test(pasta)) continue;
+        const pilha = [path.join(raiz, pasta)];
+        while (pilha.length) {
+          const atual = pilha.pop();
+          let entradas = [];
+          try { entradas = fs.readdirSync(atual, { withFileTypes: true }); }
+          catch { continue; }
+          for (const entrada of entradas) {
+            const cheio = path.join(atual, entrada.name);
+            if (entrada.isDirectory()) pilha.push(cheio);
+            else if (/^yt-dlp(?:\.exe)?$/i.test(entrada.name)) candidatos.push(cheio);
+          }
+        }
+      }
+    } catch {
+      /* winget nao usado */
+    }
+  }
+  for (const candidato of candidatos) {
+    try {
+      if (fs.existsSync(candidato) && fs.statSync(candidato).isFile()) return candidato;
+    } catch {
+      /* caminho invalido */
+    }
+  }
+  return null;
+}
+
+function isYoutubeUrl(rawUrl) {
+  try { return /(?:^|\.)youtube(?:-nocookie)?\.com$/i.test(new URL(rawUrl).hostname); }
+  catch { return false; }
+}
+
 function nomeLivre(base) {
   let alvo = `${base}.mp4`;
   let n = 1;
@@ -332,6 +384,59 @@ function runFfmpegWithProgress(ffmpeg, args, { duration = null, onProgress = nul
   });
 }
 
+function runYtDlpWithProgress(executable, args, onProgress = null) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      child.kill();
+      reject(new Error('tempo limite do yt-dlp excedido'));
+    }, MEDIA_TIMEOUT_MS);
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('download:')) continue;
+        const [downloadedRaw, totalRaw, speedRaw, etaRaw] = line.slice(9).split('|');
+        const bytes = Number(downloadedRaw || 0);
+        const total = Number(totalRaw || 0);
+        const eta = Number(etaRaw);
+        if (typeof onProgress === 'function') {
+          onProgress({
+            bytes,
+            percent: total > 0 ? Math.round(bytes / total * 100) : null,
+            speed: Number(speedRaw) > 0 ? `${(Number(speedRaw) / 1024 / 1024).toFixed(2)} MB/s` : null,
+            eta: Number.isFinite(eta) ? eta : null,
+            quality: 'Melhor disponivel'
+          });
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-4 * 1024 * 1024);
+    });
+    child.on('error', finish);
+    child.on('close', (code) => {
+      if (code === 0) finish();
+      else {
+        const detail = stderr.trim().split(/\r?\n/).filter(Boolean).pop() || `codigo ${code}`;
+        finish(new Error(detail));
+      }
+    });
+  });
+}
+
 function normalizeMediaHeaders(headers, referer) {
   const source = headers && typeof headers === 'object' ? headers : {};
   const userAgent = String(source['user-agent'] || source['User-Agent'] ||
@@ -393,6 +498,45 @@ async function downloadMedia(
   const output = nomeLivre(base);
   const startedAt = Date.now();
   const requestHeaders = normalizeMediaHeaders(headers, referer);
+  if (isYoutubeUrl(parsed.href)) {
+    const ytDlp = findYtDlp();
+    if (!ytDlp) {
+      return {
+        ok: false,
+        error: 'Esta aula usa YouTube. Instale o yt-dlp com: winget install yt-dlp.yt-dlp'
+      };
+    }
+    const args = [
+      '--no-playlist', '--newline', '--no-warnings',
+      '--progress-template', 'download:%(progress.downloaded_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s',
+      '-f', 'bestvideo*+bestaudio/best',
+      '--merge-output-format', 'mp4', '--remux-video', 'mp4',
+      '--user-agent', requestHeaders.userAgent
+    ];
+    if (requestHeaders.referer) args.push('--referer', requestHeaders.referer);
+    args.push('-o', output, parsed.href);
+    try {
+      await runYtDlpWithProgress(ytDlp, args, onProgress);
+    } catch (error) {
+      try { if (fs.existsSync(output)) fs.unlinkSync(output); } catch { /* ignora */ }
+      return { ok: false, error: `yt-dlp nao conseguiu baixar o video: ${error.message}` };
+    } finally {
+      try { if (marker && fs.existsSync(marker)) fs.unlinkSync(marker); } catch { /* marcador sem importancia */ }
+    }
+    if (!fs.existsSync(output) || fs.statSync(output).size === 0) {
+      return { ok: false, error: 'yt-dlp terminou sem gerar o video' };
+    }
+    return {
+      ok: true,
+      output,
+      ms: Date.now() - startedAt,
+      bytes: fs.statSync(output).size,
+      sourceRemoved: true,
+      quality: 'Melhor disponivel',
+      ffmpeg,
+      ytDlp
+    };
+  }
   const selectedInput = await resolveBestHlsInput(parsed.href, requestHeaders);
   const separateAudioUrl = selectedInput.audioUrl || (
     typeof audioUrl === 'string' && /^https?:\/\//i.test(audioUrl) ? audioUrl : null
@@ -634,7 +778,7 @@ async function main() {
   }
 
   if (pedido.action === 'ping') {
-    return respond({ ok: true, pong: true, ffmpeg: findFfmpeg() });
+    return respond({ ok: true, pong: true, ffmpeg: findFfmpeg(), ytDlp: findYtDlp() });
   }
   if (pedido.action === 'remux') {
     return respond(remux(pedido));
@@ -675,6 +819,7 @@ module.exports = {
   placeInFolder,
   safeDownloadTarget,
   hlsDuration,
+  findYtDlp,
   normalizeMediaHeaders,
   selectBestHlsVariant
 };

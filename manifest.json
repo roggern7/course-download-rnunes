@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Course Downloader RNUNES",
-  "version": "3.3.29",
+  "version": "3.3.30",
   "description": "Salva vídeos, textos, anexos e links de cursos em lote, organizados por Curso/Modulo/Item.",
   "minimum_chrome_version": "116",
   "permissions": [
