@@ -21,7 +21,31 @@ export function lessonDownloadBases(lessonPath) {
   const normalized = normalizeDownloadPath(lessonPath);
   const root = `${normalizeDownloadPath(DOWNLOAD_ROOT)}/`;
   const legacy = normalized.startsWith(root) ? normalized.slice(root.length) : normalized;
-  return [...new Set([normalized, legacy])].filter(Boolean);
+  const bases = [normalized, legacy].filter(Boolean);
+  const compatible = [];
+
+  for (const base of bases) {
+    const parts = base.split('/');
+    const moduleAt = parts.length - 2;
+    const lessonAt = parts.length - 1;
+    const withoutNumber = (value) => String(value || '').replace(/^\d+\s*-\s*/, '');
+    const moduleTitle = withoutNumber(parts[moduleAt]);
+    const lessonTitle = withoutNumber(parts[lessonAt]);
+
+    // Versões anteriores não numeravam a pasta do módulo e algumas também
+    // não numeravam a pasta/arquivo da aula. Aceita todas as combinações ao
+    // reconciliar, sem alterar o caminho usado nos downloads novos.
+    for (const useRawModule of [false, true]) {
+      for (const useRawLesson of [false, true]) {
+        const variant = [...parts];
+        if (moduleAt >= 0 && useRawModule) variant[moduleAt] = moduleTitle;
+        if (lessonAt >= 0 && useRawLesson) variant[lessonAt] = lessonTitle;
+        compatible.push(variant.join('/'));
+      }
+    }
+  }
+
+  return [...new Set(compatible)].filter(Boolean);
 }
 
 export function downloadMatchesKind(downloadPath, kind) {
@@ -42,9 +66,37 @@ export function downloadMatchesLesson(downloadPath, lessonPath, { videoOnly = fa
     );
     if (video.test(path)) return true;
     if (videoOnly) {
-      return new RegExp(`(?:^|/)${escaped}/[^/]+\\.(?:mp4|ts|webm|mkv|mov)$`, 'i').test(path);
+      if (new RegExp(`(?:^|/)${escaped}/[^/]+\\.(?:mp4|ts|webm|mkv|mov)$`, 'i').test(path)) {
+        return true;
+      }
+    } else if (new RegExp(`(?:^|/)${escaped}/`, 'i').test(path)) {
+      return true;
     }
-    return new RegExp(`(?:^|/)${escaped}/`, 'i').test(path);
+
+    // A ordem retornada pela SPA pode mudar conforme o módulo atualmente
+    // aberto. O índice organiza a pasta, mas não identifica a aula.
+    const parts = base.split('/');
+    if (parts.length < 3) return false;
+    const rawModule = parts.at(-2).replace(/^\d+\s*-\s*/, '');
+    const rawLesson = parts.at(-1).replace(/^\d+\s*-\s*/, '');
+    const parent = parts.slice(0, -2).map(escapeRegex).join('/');
+    const flexibleBase = [
+      parent,
+      `(?:\\d+\\s*-\\s*)?${escapeRegex(rawModule)}`,
+      `(?:\\d+\\s*-\\s*)?${escapeRegex(rawLesson)}`
+    ].join('/');
+    const direct = new RegExp(
+      `(?:^|/)${flexibleBase}(?: \\(\\d+\\))?\\.(?:mp4|ts|webm|mkv|mov)$`,
+      'i'
+    );
+    if (direct.test(path)) return true;
+    if (videoOnly) {
+      return new RegExp(
+        `(?:^|/)${flexibleBase}/[^/]+\\.(?:mp4|ts|webm|mkv|mov)$`,
+        'i'
+      ).test(path);
+    }
+    return new RegExp(`(?:^|/)${flexibleBase}/`, 'i').test(path);
   });
 }
 

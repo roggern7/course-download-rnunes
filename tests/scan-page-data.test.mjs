@@ -28,6 +28,29 @@ function fakePage(state) {
   });
 }
 
+function fakeHotmartPage(state) {
+  class FakeNode {}
+  const document = {
+    title: 'Mestres do Algoritmo 2.0 | Hotmart Club',
+    querySelectorAll() { return []; }
+  };
+  const location = {
+    origin: 'https://hotmart.com',
+    pathname: '/pt-BR/club/mda-academy/products/produto-123/content/aula-atual',
+    href: 'https://hotmart.com/pt-BR/club/mda-academy/products/produto-123/content/aula-atual'
+  };
+  const window = { __INITIAL_STATE__: state };
+  return vm.createContext({
+    URL,
+    WeakSet,
+    Node: FakeNode,
+    decodeURIComponent,
+    document,
+    location,
+    window
+  });
+}
+
 class FakeElement {
   constructor(text = '', attributes = {}) {
     this.innerText = text;
@@ -147,4 +170,69 @@ test('descobre extras visíveis mesmo quando a coleção React tem nome desconhe
   );
   assert.ok(extras.lessons.every((lesson) => lesson.isBonus));
   assert.ok(extras.lessons.every((lesson) => lesson.url.includes('/__bonus__-')));
+});
+
+test('Hotmart preserva módulos dentro de Todos os conteúdos', async () => {
+  const lesson = (title, hash) => ({ title, hash, type: 'video' });
+  const state = {
+    navigation: {
+      title: 'Todos os conteúdos',
+      contents: [
+        {
+          title: 'START - O COMEÇO DA SUA JORNADA',
+          url: '/pt-BR/club/mda-academy/products/produto-123/content/modulo-start',
+          lessonCount: 2,
+          contents: [
+            lesson('Boas-vindas', 'aula-boas-vindas'),
+            lesson('Como usar o curso', 'aula-como-usar')
+          ]
+        },
+        {
+          title: 'MÃO NA MASSA',
+          url: '/pt-BR/club/mda-academy/products/produto-123/content/modulo-pratica',
+          lessonCount: 2,
+          contents: [
+            lesson('Criando o canal', 'aula-criando-canal'),
+            lesson('Primeiro vídeo', 'aula-primeiro-video')
+          ]
+        }
+      ]
+    }
+  };
+
+  const result = await new vm.Script(script).runInContext(fakeHotmartPage(state));
+  assert.equal(result.ok, true);
+  assert.equal(result.lessonCount, 4);
+  assert.deepEqual(
+    Array.from(result.modules, (module) => [
+      module.title,
+      Array.from(module.lessons, (item) => item.title)
+    ]),
+    [
+      ['START - O COMEÇO DA SUA JORNADA', ['Boas-vindas', 'Como usar o curso']],
+      ['MÃO NA MASSA', ['Criando o canal', 'Primeiro vídeo']]
+    ]
+  );
+});
+
+test('Hotmart não transforma cartões resumidos de módulos em aulas', async () => {
+  const state = {
+    navigation: {
+      title: 'Todos os conteúdos',
+      contents: [
+        {
+          title: 'Módulo 6 aulas 17% START - O COMEÇO DA SUA JORNADA',
+          url: '/pt-BR/club/mda-academy/products/produto-123/content/modulo-start'
+        },
+        {
+          title: 'Módulo 17 aulas 0% MÃO NA MASSA',
+          url: '/pt-BR/club/mda-academy/products/produto-123/content/modulo-pratica'
+        }
+      ]
+    }
+  };
+
+  const result = await new vm.Script(script).runInContext(fakeHotmartPage(state));
+  assert.equal(result.ok, false);
+  assert.equal(result.modules.length, 0);
 });

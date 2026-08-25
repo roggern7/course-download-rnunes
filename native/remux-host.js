@@ -700,6 +700,52 @@ function allowedResource(name, kind) {
   return !/\.html?$/i.test(name);
 }
 
+function comparableCourseName(value) {
+  return String(value || '')
+    .normalize('NFC')
+    .replace(/^\d+\s*-\s*/, '')
+    .trim()
+    .toLocaleLowerCase('pt-BR');
+}
+
+function findCourseFileIgnoringOrdinal(downloadsRoot, relative, kind) {
+  const expected = safeDownloadTarget(downloadsRoot, relative);
+  if (!expected) return null;
+  const expectedModule = comparableCourseName(path.basename(path.dirname(expected)));
+  const expectedLesson = comparableCourseName(path.basename(expected));
+  const courseDirectory = path.dirname(path.dirname(expected));
+  const isAllowed = (name) => {
+    if (kind === 'video') return /\.(?:mp4|ts|webm|mkv|mov)$/i.test(name);
+    return allowedResource(name, kind);
+  };
+  const fileStem = (name) => comparableCourseName(
+    name.replace(/\.[^.]+$/, '').replace(/ \(\d+\)$/, '')
+  );
+
+  try {
+    const moduleEntry = fs.readdirSync(courseDirectory, { withFileTypes: true })
+      .find((entry) => entry.isDirectory() && comparableCourseName(entry.name) === expectedModule);
+    if (!moduleEntry) return null;
+    const moduleDirectory = path.join(courseDirectory, moduleEntry.name);
+    const entries = fs.readdirSync(moduleDirectory, { withFileTypes: true });
+    const direct = entries.find((entry) =>
+      entry.isFile() && isAllowed(entry.name) && fileStem(entry.name) === expectedLesson
+    );
+    if (direct) return path.join(moduleDirectory, direct.name);
+
+    const lessonDirectory = entries.find((entry) =>
+      entry.isDirectory() && comparableCourseName(entry.name) === expectedLesson
+    );
+    if (!lessonDirectory) return null;
+    const nestedPath = path.join(moduleDirectory, lessonDirectory.name);
+    const nested = fs.readdirSync(nestedPath, { withFileTypes: true })
+      .find((entry) => entry.isFile() && isAllowed(entry.name));
+    return nested ? path.join(nestedPath, nested.name) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Recupera a associacao aula -> arquivo quando o usuario apagou o historico
  * de downloads do Chrome. Somente caminhos relativos abaixo de Downloads sao
@@ -752,6 +798,12 @@ function findCourseFiles(items, downloadsRoot = path.join(os.homedir(), 'Downloa
       }
 
       if (found) break;
+    }
+    if (!found) {
+      for (const relative of item.bases.slice(0, 4)) {
+        found = findCourseFileIgnoringOrdinal(downloadsRoot, relative, item.kind);
+        if (found) break;
+      }
     }
     if (found) matches[item.key] = found;
   }

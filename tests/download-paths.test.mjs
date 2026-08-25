@@ -22,6 +22,15 @@ test('reconhece aula salva na raiz atual e na raiz antiga', () => {
   ), true);
 });
 
+test('reconhece download antigo sem numeração na pasta do módulo', () => {
+  const current = 'Course Downloader RNUNES/MDA Academy/01 - DOMINANDO AS FERRAMENTAS/01 - Aula 0 - Introdução';
+  const oldNested = 'C:\\Users\\Test User\\Downloads\\Course Downloader RNUNES\\MDA Academy\\07 - DOMINANDO AS FERRAMENTAS\\09 - Aula 0 - Introdução\\Aula 0 - Introdução.mp4';
+  const oldDirect = 'C:\\Users\\Test User\\Downloads\\Course Downloader RNUNES\\MDA Academy\\07 - DOMINANDO AS FERRAMENTAS\\09 - Aula 0 - Introdução.mp4';
+
+  assert.equal(downloadMatchesLesson(oldNested, current, { videoOnly: true }), true);
+  assert.equal(downloadMatchesLesson(oldDirect, current, { videoOnly: true }), true);
+});
+
 test('bonus de video ignora o HTML errado e aceita MP4', () => {
   const bonus = 'Course Downloader RNUNES/Agentes De Ia Na Pratica V2/11 - Extras da trilha/03 - Call Ao Vivo Gravada';
   const html = 'C:\\Users\\Test User\\Downloads\\Agentes De Ia Na Pratica V2\\11 - Extras da trilha\\03 - Call Ao Vivo Gravada.htm';

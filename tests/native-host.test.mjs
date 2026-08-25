@@ -84,10 +84,11 @@ test('host recupera arquivos mesmo sem historico do Chrome', (t) => {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const videoBase = 'Course Downloader RNUNES/Curso/01 - Modulo/01 - Aula';
+  const oldVideoBase = 'Course Downloader RNUNES/Curso/07 - Modulo/09 - Aula';
   const textBase = 'Course Downloader RNUNES/Curso/02 - Extras/01 - Texto';
   const wrongBase = 'Course Downloader RNUNES/Curso/02 - Extras/02 - Video errado';
-  fs.mkdirSync(path.join(root, path.dirname(videoBase)), { recursive: true });
-  fs.writeFileSync(path.join(root, `${videoBase}.ts`), 'video');
+  fs.mkdirSync(path.join(root, path.dirname(oldVideoBase)), { recursive: true });
+  fs.writeFileSync(path.join(root, `${oldVideoBase}.ts`), 'video');
   fs.mkdirSync(path.join(root, textBase), { recursive: true });
   fs.writeFileSync(path.join(root, textBase, 'Texto.txt'), 'texto');
   fs.mkdirSync(path.join(root, path.dirname(wrongBase)), { recursive: true });
@@ -100,7 +101,7 @@ test('host recupera arquivos mesmo sem historico do Chrome', (t) => {
   ], root);
 
   assert.equal(result.ok, true);
-  assert.match(result.matches.video, /01 - Aula\.ts$/);
+  assert.match(result.matches.video, /09 - Aula\.ts$/);
   assert.match(result.matches.texto, /Texto\.txt$/);
   assert.equal(result.matches.errado, undefined);
 });

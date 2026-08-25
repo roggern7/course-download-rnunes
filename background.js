@@ -1187,6 +1187,7 @@ async function scanCourse(tabId) {
  * ------------------------------------------------------------------ */
 
 const COURSE_KEY = 'courses';
+const COURSE_SCAN_SCHEMA = 2;
 
 async function getCourseCache() {
   try {
@@ -1205,6 +1206,7 @@ async function getCourseCache() {
 function cacheCovers(entry, tabUrl) {
   if (!entry || !entry.prefix || entry.prefix === '/') return false;
   if (!entry.lessonCount) return false;
+  if (entry.scanSchema !== COURSE_SCAN_SCHEMA) return false;
   try {
     const url = new URL(tabUrl);
     return entry.origin === url.origin &&
@@ -1246,7 +1248,12 @@ async function courseScan(tabId, { force = false } = {}) {
     /* sem origem utilizavel */
   }
 
-  const entry = { ...result.course, origin, scannedAt: Date.now() };
+  const entry = {
+    ...result.course,
+    origin,
+    scannedAt: Date.now(),
+    scanSchema: COURSE_SCAN_SCHEMA
+  };
 
   if (origin && entry.prefix && entry.prefix !== '/' && entry.lessonCount) {
     const cache = await getCourseCache();
@@ -1550,7 +1557,9 @@ function lessonPath(courseTitle, item) {
   return [
     'Course Downloader RNUNES',
     sanitizeFilename(courseTitle, 'Curso'),
-    sanitizeFilename(numbered(item.moduleIndex, item.moduleTitle), `Modulo ${pad(item.moduleIndex)}`),
+    // A posição pode mudar conforme o módulo aberto quando a Hotmart monta a
+    // navegação. O título do módulo é a parte estável do caminho.
+    sanitizeFilename(item.moduleTitle, `Modulo ${pad(item.moduleIndex)}`),
     sanitizeFilename(numbered(item.lessonIndex, item.title), `Aula ${pad(item.lessonIndex)}`)
   ].join('/');
 }

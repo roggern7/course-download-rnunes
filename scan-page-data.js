@@ -118,6 +118,21 @@
     );
   }
 
+  function looksLikeModuleSummary(obj, title = directTitle(obj)) {
+    if (/^m[oó]dulo\s+\d+\s+aulas?\s+\d{1,3}%(?:\s|$)/i.test(clean(title))) return true;
+    return ownEntries(obj).some(([key, value]) =>
+      /^(lesson|aula|content)_?count$/i.test(key) && Number(value) > 1
+    );
+  }
+
+  function nestedContentCollections(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return [];
+    return ownEntries(obj).filter(([key, value]) =>
+      Array.isArray(value) &&
+      (lessonKey.test(key) || resourceKey.test(key) || contentKey.test(key))
+    );
+  }
+
   function directKind(obj) {
     for (const [key, value] of ownEntries(obj)) {
       if (!/^(type|tipo|kind|format|content_?type|lesson_?type)$/i.test(key)) continue;
@@ -167,6 +182,11 @@
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
     const title = directTitle(obj);
     if (!title) return null;
+
+    // A navegação nova da Hotmart expõe os módulos dentro de `contents` e
+    // fornece uma URL para cada cartão. URL interna, sozinha, não transforma
+    // um cartão "Módulo 6 aulas 17% ..." em aula.
+    if (looksLikeModuleSummary(obj, title)) return null;
 
     const explicitUrl = directUrl(obj);
     let id = directId(obj);
@@ -397,7 +417,22 @@
           addGroup(groupTitle, lessonsIn(child, true));
         }
         else if (contentKey.test(key)) {
-          const contents = lessonsIn(child, false);
+          const containers = child.filter((item) => nestedContentCollections(item).length);
+          const leaves = child.filter((item) => !nestedContentCollections(item).length);
+
+          // Hotmart: `Todos os conteúdos -> módulo -> contents -> aulas`.
+          // Mantém cada módulo como grupo e só transforma as folhas em aulas.
+          for (const container of containers) {
+            const groupTitle = directTitle(container) || objectTitle || parentTitle;
+            for (const [nestedKey, nested] of nestedContentCollections(container)) {
+              addGroup(groupTitle, lessonsIn(
+                nested,
+                lessonKey.test(nestedKey) || resourceKey.test(nestedKey)
+              ));
+            }
+          }
+
+          const contents = lessonsIn(leaves, false);
           if (contents.length) addGroup(objectTitle || parentTitle, contents);
         }
       }
