@@ -27,6 +27,7 @@ import {
 } from './download-paths.js';
 import {
   isAuthorizationDownloadError,
+  isProtectedMediaError,
   stopBatchOnItemFailure
 } from './batch-policy.js';
 import { COMPLETION_CONTROL_PATTERN } from './navigation-policy.js';
@@ -3929,6 +3930,31 @@ async function retryFailed() {
   return { ok: true };
 }
 
+/** Ignora somente a aula protegida atual e retoma a fila na seguinte. */
+async function skipProtectedAndContinue() {
+  await loadBatch();
+  if (!batch || batch.status !== 'failed') {
+    return { ok: false, error: 'A fila nao esta parada em uma falha.' };
+  }
+  const item = batch.items[batch.cursor];
+  if (!item || !isProtectedMediaError(item.error)) {
+    return { ok: false, error: 'A falha atual nao e uma midia protegida.' };
+  }
+
+  item.status = 'protected';
+  item.protectedReason = item.error;
+  item.phase = null;
+  item.skippedAt = Date.now();
+  batch.cursor++;
+  batch.status = 'running';
+  delete batch.finishedAt;
+  saveBatch();
+
+  chrome.alarms.create(WATCHDOG, { periodInMinutes: 0.5 });
+  pumpBatch();
+  return { ok: true };
+}
+
 /**
  * O service worker pode ser encerrado durante uma pausa longa da fila (uma aula
  * sem video, por exemplo). Este alarme o traz de volta e retoma de onde parou.
@@ -3999,6 +4025,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (type === 'retry-failed') {
     retryFailed().then(sendResponse);
+    return true;
+  }
+
+  if (type === 'skip-protected') {
+    skipProtectedAndContinue().then(sendResponse);
     return true;
   }
 

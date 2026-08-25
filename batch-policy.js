@@ -5,6 +5,11 @@ export function isAuthorizationDownloadError(error) {
   return /\bHTTP\s+(?:401|403)\b/i.test(String(error || ''));
 }
 
+/** Conteudo protegido nao deve ser refeito em loop; pode ser ignorado manualmente. */
+export function isProtectedMediaError(error) {
+  return /playlist criptografada|METHOD=(?:AES-128|SAMPLE-AES)|\bDRM\b/i.test(String(error || ''));
+}
+
 /** Uma falha real nunca deve fazer o cursor consumir a aula seguinte. */
 export function shouldStopBatchAfterItem(item) {
   return item?.status === 'error' || item?.status === 'skipped';

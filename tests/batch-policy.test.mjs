@@ -3,9 +3,16 @@ import assert from 'node:assert/strict';
 
 import {
   isAuthorizationDownloadError,
+  isProtectedMediaError,
   shouldStopBatchAfterItem,
   stopBatchOnItemFailure
 } from '../batch-policy.js';
+
+test('reconhece playlist protegida que pode ser ignorada manualmente', () => {
+  assert.equal(isProtectedMediaError('Playlist criptografada (METHOD=AES-128).'), true);
+  assert.equal(isProtectedMediaError('Playlist criptografada (METHOD=SAMPLE-AES).'), true);
+  assert.equal(isProtectedMediaError('HTTP 403 em master.m3u8'), false);
+});
 
 test('reconhece 401 e 403 como falhas que aceitam fallback com Referer', () => {
   assert.equal(isAuthorizationDownloadError('HTTP 403 em master.m3u8'), true);

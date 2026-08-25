@@ -12,6 +12,7 @@
  */
 
 import { formatBytes, formatDuration } from './hls.js';
+import { isProtectedMediaError } from './batch-policy.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -41,6 +42,7 @@ const activityShowEl = $('activity-show');
 const activityCloseEl = $('activity-close');
 const batchPauseEl = $('batch-pause');
 const batchRetryEl = $('batch-retry');
+const batchSkipProtectedEl = $('batch-skip-protected');
 
 const courseBarEl = $('course-bar');
 const selectAllBtn = $('select-all');
@@ -140,13 +142,15 @@ function setBar(percent, indeterminado) {
 
 function contarFila(batch) {
   const counts = {
-    done: 0, exists: 0, skipped: 0, locked: 0, error: 0, pending: 0, active: 0
+    done: 0, exists: 0, skipped: 0, protected: 0, locked: 0,
+    error: 0, pending: 0, active: 0
   };
   for (const item of batch.items) {
     if (counts[item.status] !== undefined) counts[item.status]++;
   }
   counts.total = batch.items.length;
-  counts.settled = counts.done + counts.exists + counts.skipped + counts.locked + counts.error;
+  counts.settled = counts.done + counts.exists + counts.skipped + counts.protected +
+    counts.locked + counts.error;
   counts.percent = counts.total ? Math.round((counts.settled / counts.total) * 100) : 0;
   return counts;
 }
@@ -155,6 +159,7 @@ function resumoFila(c) {
   const partes = [plural(c.done, 'salvo', 'salvos')];
   if (c.exists) partes.push(`${c.exists} já salvos`);
   if (c.skipped) partes.push(`${c.skipped} sem video`);
+  if (c.protected) partes.push(`${c.protected} protegidas`);
   if (c.locked) partes.push(`${c.locked} bloqueadas`);
   if (c.error) partes.push(`${c.error} com erro`);
   return partes.join(' · ');
@@ -166,6 +171,7 @@ function renderFila(batch, job) {
   const pausada = batch.status === 'paused';
   const terminada = !rodando && !pausada;
   const atual = batch.items[batch.cursor];
+  const protectedFailure = batch.status === 'failed' && isProtectedMediaError(atual?.error);
   // Erro de download/navegacao e mais util que uma aula legitimamente sem
   // video. Antes, um unico item ignorado escondia dezenas de erros reais.
   const firstFailure =
@@ -219,13 +225,15 @@ function renderFila(batch, job) {
     const total = `${plural(c.total, 'item', 'itens')}: ${resumoFila(c)}.`;
     if (batch.status === 'failed') {
       const detail = firstFailure ? ` Falha: ${firstFailure.error}.` : '';
-      setNote(
-        `A fila parou nesta aula para nao pular as seguintes.${detail} Use "Tentar novamente" para refazer esta aula.`,
-        'warn'
-      );
+      setNote(protectedFailure
+        ? `Esta aula usa midia protegida e nao sera baixada.${detail} Use "Ignorar protegida" para continuar a fila.`
+        : `A fila parou nesta aula para nao pular as seguintes.${detail} Use "Tentar novamente" para refazer esta aula.`,
+      'warn');
     } else if (c.error || c.skipped) {
       const detail = firstFailure ? ` Primeira falha: ${firstFailure.error}.` : '';
       setNote(`${total}${detail} Use "Tentar novamente" para refazer so as que falharam.`, 'warn');
+    } else if (c.protected) {
+      setNote(`${total} As aulas protegidas nao foram baixadas.`, 'warn');
     } else if (c.locked) {
       const detail = firstFailure ? ` ${firstFailure.error}.` : '';
       setNote(`${total}${detail} Reescaneie o curso depois da liberacao.`, 'warn');
@@ -242,7 +250,8 @@ function renderFila(batch, job) {
   const repetiveis = c.error + c.skipped;
   const naoProcessadas = c.pending + c.active;
   const restantes = repetiveis + naoProcessadas;
-  batchRetryEl.hidden = !(terminada && restantes);
+  batchRetryEl.hidden = protectedFailure || !(terminada && restantes);
+  batchSkipProtectedEl.hidden = !protectedFailure;
   batchRetryEl.textContent = batch.status === 'failed'
     ? `Tentar novamente (${repetiveis})`
     : naoProcessadas
@@ -298,6 +307,7 @@ function renderAvulso(job) {
   setFile(job);
   batchPauseEl.hidden = true;
   batchRetryEl.hidden = true;
+  batchSkipProtectedEl.hidden = true;
   activityCloseEl.textContent = rodando ? 'Cancelar' : 'Fechar';
 }
 
@@ -478,6 +488,7 @@ const STATE_LABEL = {
   done: ['Salvo', 'state-done'],
   exists: ['Já salvo', 'state-done'],
   skipped: ['Sem video', 'state-skip'],
+  protected: ['Protegida', 'state-skip'],
   locked: ['Bloqueada', 'state-skip'],
   error: ['Erro', 'state-err']
 };
@@ -712,6 +723,11 @@ batchRetryEl.addEventListener('click', async () => {
   await refresh();
 });
 
+batchSkipProtectedEl.addEventListener('click', async () => {
+  await send({ type: 'skip-protected' });
+  await refresh();
+});
+
 /* ------------------------------------------------------------------ *
  * Render
  * ------------------------------------------------------------------ */
@@ -906,7 +922,8 @@ function renderProgressView() {
       `${counts.done + counts.exists} salvas`,
       `${counts.pending + counts.active} restantes`,
       counts.error ? `${counts.error} com erro` : null,
-      counts.skipped ? `${counts.skipped} sem video` : null
+      counts.skipped ? `${counts.skipped} sem video` : null,
+      counts.protected ? `${counts.protected} protegidas` : null
     ].filter(Boolean).join(' · ');
     dashboard.appendChild(summaryPanel);
   }
