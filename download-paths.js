@@ -12,6 +12,61 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function comparablePathPart(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/^\d+\s*-\s*/, '')
+    .replace(/ \(\d+\)$/, '')
+    .trim()
+    .toLocaleLowerCase('pt-BR');
+}
+
+function compatibleCourseName(actual, expected) {
+  const left = comparablePathPart(actual);
+  const right = comparablePathPart(expected);
+  return Boolean(left && right) && (
+    left === right ||
+    (right.length >= 6 && left.includes(right)) ||
+    (left.length >= 6 && right.includes(left))
+  );
+}
+
+/**
+ * Alguns portais mudam o titulo do curso e, durante a transicao, expõem uma
+ * pasta intermediaria como "Alterar nome para <novo titulo>". Reconhece a
+ * aula pelo par estavel Modulo/Aula, mas exige que uma pasta ancestral ainda
+ * identifique o curso para nao misturar cursos diferentes.
+ */
+function matchesRenamedCourse(downloadPath, lessonPath, videoOnly) {
+  const expected = normalizeDownloadPath(lessonPath).split('/').filter(Boolean);
+  if (expected.length < 3) return false;
+  const expectedCourse = expected.at(-3);
+  const expectedModule = comparablePathPart(expected.at(-2));
+  const expectedLesson = comparablePathPart(expected.at(-1));
+
+  const parts = normalizeDownloadPath(downloadPath).split('/').filter(Boolean);
+  const leaf = parts.at(-1) || '';
+  const leafWithoutExtension = leaf.replace(/\.[^.]+$/, '');
+  const possibleLessonIndexes = [];
+  if (comparablePathPart(leafWithoutExtension) === expectedLesson) {
+    possibleLessonIndexes.push(parts.length - 1);
+  }
+  // Videos e recursos antigos tambem podem ficar dentro de uma pasta da aula.
+  if (parts.length >= 2 && comparablePathPart(parts.at(-2)) === expectedLesson) {
+    possibleLessonIndexes.push(parts.length - 2);
+  }
+
+  return possibleLessonIndexes.some((lessonIndex) => {
+    const moduleIndex = lessonIndex - 1;
+    if (moduleIndex < 1 || comparablePathPart(parts[moduleIndex]) !== expectedModule) return false;
+    if (videoOnly && !/\.(?:mp4|ts|webm|mkv|mov)$/i.test(leaf)) return false;
+    return parts.slice(0, moduleIndex).some((part) =>
+      compatibleCourseName(part, expectedCourse)
+    );
+  });
+}
+
 /**
  * A versao antiga salvava em Downloads/Curso; a atual usa
  * Downloads/Course Downloader RNUNES/Curso. Os dois caminhos representam a
@@ -58,7 +113,7 @@ export function downloadMatchesKind(downloadPath, kind) {
 
 export function downloadMatchesLesson(downloadPath, lessonPath, { videoOnly = false } = {}) {
   const path = normalizeDownloadPath(downloadPath);
-  return lessonDownloadBases(lessonPath).some((base) => {
+  const regularMatch = lessonDownloadBases(lessonPath).some((base) => {
     const escaped = escapeRegex(base);
     const video = new RegExp(
       `(?:^|/)${escaped}(?: \\(\\d+\\))?\\.(?:mp4|ts|webm|mkv|mov)$`,
@@ -98,6 +153,7 @@ export function downloadMatchesLesson(downloadPath, lessonPath, { videoOnly = fa
     }
     return new RegExp(`(?:^|/)${flexibleBase}/`, 'i').test(path);
   });
+  return regularMatch || matchesRenamedCourse(path, lessonPath, videoOnly);
 }
 
 /**

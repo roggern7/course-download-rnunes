@@ -62,3 +62,10 @@ test('salva o video diretamente dentro do modulo', () => {
     filename: '01 - Aula 0 - Introducao.mp4'
   });
 });
+
+test('reconhece aula depois que o portal renomeia o curso', () => {
+  const current = 'Course Downloader RNUNES/Fórmula Youtube 2026/Introdução ao YouTube/01 - Introdução ao Treinamento';
+  const old = 'C:\\Users\\Test User\\Downloads\\Course Downloader RNUNES\\Peter Jordan 2026\\Alterar nome para Formula Youtube 2026\\01 - Introdução ao YouTube\\01 - Introdução ao Treinamento.ts';
+
+  assert.equal(downloadMatchesLesson(old, current, { videoOnly: true }), true);
+});

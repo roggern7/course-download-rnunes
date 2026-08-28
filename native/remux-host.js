@@ -715,18 +715,24 @@ function allowedResource(name, kind) {
 
 function comparableCourseName(value) {
   return String(value || '')
-    .normalize('NFC')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/^\d+\s*-\s*/, '')
     .trim()
     .toLocaleLowerCase('pt-BR');
 }
 
-function findCourseFileIgnoringOrdinal(downloadsRoot, relative, kind) {
-  const expected = safeDownloadTarget(downloadsRoot, relative);
-  if (!expected) return null;
-  const expectedModule = comparableCourseName(path.basename(path.dirname(expected)));
-  const expectedLesson = comparableCourseName(path.basename(expected));
-  const courseDirectory = path.dirname(path.dirname(expected));
+function compatibleCourseName(actual, expected) {
+  const left = comparableCourseName(actual);
+  const right = comparableCourseName(expected);
+  return Boolean(left && right) && (
+    left === right ||
+    (right.length >= 6 && left.includes(right)) ||
+    (left.length >= 6 && right.includes(left))
+  );
+}
+
+function findLessonInCourseDirectory(courseDirectory, expectedModule, expectedLesson, kind) {
   const isAllowed = (name) => {
     if (kind === 'video') return /\.(?:mp4|ts|webm|mkv|mov)$/i.test(name);
     return allowedResource(name, kind);
@@ -757,6 +763,53 @@ function findCourseFileIgnoringOrdinal(downloadsRoot, relative, kind) {
   } catch {
     return null;
   }
+}
+
+function findCourseFileIgnoringOrdinal(downloadsRoot, relative, kind) {
+  const expected = safeDownloadTarget(downloadsRoot, relative);
+  if (!expected) return null;
+  const expectedModule = comparableCourseName(path.basename(path.dirname(expected)));
+  const expectedLesson = comparableCourseName(path.basename(expected));
+  const courseDirectory = path.dirname(path.dirname(expected));
+  return findLessonInCourseDirectory(courseDirectory, expectedModule, expectedLesson, kind);
+}
+
+/** Procura tambem em uma pasta antiga quando o portal renomeou o curso. */
+function findCourseFileAfterRename(downloadsRoot, relative, kind) {
+  const expected = safeDownloadTarget(downloadsRoot, relative);
+  if (!expected) return null;
+  const expectedCourseDirectory = path.dirname(path.dirname(expected));
+  const coursesRoot = path.dirname(expectedCourseDirectory);
+  const expectedCourse = path.basename(expectedCourseDirectory);
+  const expectedModule = comparableCourseName(path.basename(path.dirname(expected)));
+  const expectedLesson = comparableCourseName(path.basename(expected));
+
+  try {
+    for (const courseEntry of fs.readdirSync(coursesRoot, { withFileTypes: true })) {
+      if (!courseEntry.isDirectory()) continue;
+      const courseDirectory = path.join(coursesRoot, courseEntry.name);
+      const candidates = [];
+      if (compatibleCourseName(courseEntry.name, expectedCourse)) candidates.push(courseDirectory);
+      try {
+        for (const nested of fs.readdirSync(courseDirectory, { withFileTypes: true })) {
+          if (nested.isDirectory() && compatibleCourseName(nested.name, expectedCourse)) {
+            candidates.push(path.join(courseDirectory, nested.name));
+          }
+        }
+      } catch {
+        /* curso inacessivel */
+      }
+      for (const candidate of candidates) {
+        const found = findLessonInCourseDirectory(
+          candidate, expectedModule, expectedLesson, kind
+        );
+        if (found) return found;
+      }
+    }
+  } catch {
+    /* raiz inexistente */
+  }
+  return null;
 }
 
 /**
@@ -815,6 +868,12 @@ function findCourseFiles(items, downloadsRoot = path.join(os.homedir(), 'Downloa
     if (!found) {
       for (const relative of item.bases.slice(0, 4)) {
         found = findCourseFileIgnoringOrdinal(downloadsRoot, relative, item.kind);
+        if (found) break;
+      }
+    }
+    if (!found) {
+      for (const relative of item.bases.slice(0, 4)) {
+        found = findCourseFileAfterRename(downloadsRoot, relative, item.kind);
         if (found) break;
       }
     }

@@ -127,3 +127,28 @@ test('organiza o MP4 do bonus dentro da pasta 03', (t) => {
     '03 - Call Ao Vivo Gravada.mp4'
   )), true);
 });
+
+test('host recupera aula de curso renomeado dentro de pasta intermediaria', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'course-downloader-rename-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const oldFile = path.join(
+    root,
+    'Course Downloader RNUNES',
+    'Peter Jordan 2026',
+    'Alterar nome para Formula Youtube 2026',
+    '01 - Introdução ao YouTube',
+    '01 - Introdução ao Treinamento.ts'
+  );
+  fs.mkdirSync(path.dirname(oldFile), { recursive: true });
+  fs.writeFileSync(oldFile, 'video');
+
+  const result = findCourseFiles([{
+    key: 'lesson',
+    bases: [
+      'Course Downloader RNUNES/Fórmula Youtube 2026/Introdução ao YouTube/01 - Introdução ao Treinamento'
+    ],
+    kind: 'video'
+  }], root);
+
+  assert.equal(result.matches.lesson, oldFile);
+});
