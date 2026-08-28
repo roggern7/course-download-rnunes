@@ -5,6 +5,7 @@ import {
   autoSkipProtectedItem,
   isExplicitEmptyLessonText,
   isAuthorizationDownloadError,
+  isIgnoredLessonTitle,
   isProtectedMediaError,
   shouldStopBatchAfterItem,
   stopBatchOnItemFailure
@@ -43,6 +44,13 @@ test('reconhece somente avisos explicitos de aula vazia', () => {
   assert.equal(isExplicitEmptyLessonText('No content yet...'), true);
   assert.equal(isExplicitEmptyLessonText('Procurando o vídeo...'), false);
   assert.equal(isExplicitEmptyLessonText('sem URL de vídeo detectada'), false);
+});
+
+test('ignora canais de suporte sem confundir aulas normais', () => {
+  assert.equal(isIgnoredLessonTitle('CANAIS DE SUPORTE'), true);
+  assert.equal(isIgnoredLessonTitle('Canal de suporte'), true);
+  assert.equal(isIgnoredLessonTitle('Como usar os canais de suporte'), false);
+  assert.equal(isIgnoredLessonTitle('Introducao ao treinamento'), false);
 });
 
 test('reconhece 401 e 403 como falhas que aceitam fallback com Referer', () => {

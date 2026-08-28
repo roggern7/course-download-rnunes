@@ -17,6 +17,16 @@ export function isExplicitEmptyLessonText(value) {
   return EMPTY_LESSON_PATTERN.test(String(value || '').replace(/\s+/g, ' ').trim());
 }
 
+/** Cards informativos que nao representam uma aula nem possuem midia. */
+export function isIgnoredLessonTitle(value) {
+  const title = String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return /^(?:canal|canais) de suporte$/i.test(title);
+}
+
 /** Marca a aula protegida e avanca somente um item, sem interromper a fila. */
 export function autoSkipProtectedItem(batch, item, now = Date.now()) {
   if (!batch || item?.status !== 'error' || !isProtectedMediaError(item.error)) return false;

@@ -29,6 +29,7 @@ import {
   autoSkipProtectedItem,
   EMPTY_LESSON_PATTERN,
   isAuthorizationDownloadError,
+  isIgnoredLessonTitle,
   isProtectedMediaError,
   stopBatchOnItemFailure
 } from './batch-policy.js';
@@ -4280,6 +4281,17 @@ async function runBatchItem(item) {
   item.phase = 'Abrindo a aula…';
   item.error = null;
   saveBatch();
+
+  // A Hotmart lista este card junto das aulas, mas ele serve apenas como
+  // atalho informativo e nao possui video ou material para baixar.
+  if (isIgnoredLessonTitle(item.title)) {
+    item.status = 'empty';
+    item.phase = null;
+    item.emptyReason = 'Canal de suporte ignorado automaticamente';
+    item.skippedAt = Date.now();
+    saveBatch();
+    return;
+  }
 
   // Uma aula salva, selecionada novamente, passa uma vez para buscar materiais
   // que as versoes antigas ignoravam. O video existente nao e baixado de novo.
