@@ -41,6 +41,9 @@
   const TRAILING_NOISE =
     /\s*\b(conclu[ií]d[oa]s?|assistid[oa]s?|em andamento|n[aã]o iniciad[oa]|bloquead[oa]|liberad[oa]|novo|gr[aá]tis|preview)\b\s*$/i;
   const TRAILING_TIME = /\s*\b\d{1,2}:\d{2}(?::\d{2})?\s*$/;
+  const LEADING_PLAYBACK = /^(?:tocando agora|reproduzindo agora|playing now)\s+/i;
+  const TRAILING_AVAILABILITY =
+    /\s+dispon[ií]vel(?:\s+(?:at[eé]|em|a partir de))?(?:\s|$).*$/i;
 
   /* Primeiro segmento que indica "isto agrupa aulas", nao "isto e uma aula". */
   const MODULE_SEGMENTS = new Set([
@@ -58,6 +61,7 @@
   const HEADING_TAGS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'SUMMARY', 'LEGEND', 'DT']);
   const HEADING_CLASS =
     /(module|modulo|m[oó]dulo|chapter|capitulo|cap[ií]tulo|section-title|sectiontitle|unidade|unit|group-title|grouptitle|accordion|collapse-title|panel-title)/i;
+  const MODULE_CARD = /^m[oó]dulo\s+\d+\s+aulas?\s+\d{1,3}%(?:\s|$)/i;
 
   const URL_ATTRS = ['href', 'data-href', 'data-url', 'data-link', 'data-to', 'data-path'];
 
@@ -69,13 +73,23 @@
    * ---------------------------------------------------------------- */
 
   function tidyTitle(text) {
-    let out = clean(text);
+    let out = clean(text).replace(LEADING_PLAYBACK, '');
     for (let i = 0; i < 3; i++) {
       const before = out;
-      out = out.replace(TRAILING_NOISE, '').replace(TRAILING_TIME, '');
+      out = out
+        .replace(TRAILING_AVAILABILITY, '')
+        .replace(TRAILING_NOISE, '')
+        .replace(TRAILING_TIME, '');
       if (out === before) break;
     }
     return clean(out.replace(/^[\s|·—–-]+|[\s|·—–-]+$/g, '')) || clean(text);
+  }
+
+  function moduleCardTitle(text) {
+    return clean(text)
+      .replace(/^m[oó]dulo\s+\d+\s+aulas?\s+\d{1,3}%\s*/i, '')
+      .replace(/\s+acessar\s+\d{1,3}%.*$/i, '')
+      .trim() || 'Módulo';
   }
 
   function textOf(el) {
@@ -168,18 +182,25 @@
       if (url.origin !== here.origin) continue;
       if (!url.pathname.startsWith(prefix)) continue;
 
-      const kind = classify(url, prefix);
+      let kind = classify(url, prefix);
       if (!kind) continue;
-
-      const key = kind + '|' + url.pathname + (url.search || '');
-      if (seen.has(key)) continue;
 
       const title = tidyTitle(textOf(node));
       if (title.length < 2 || title.length > 200) continue;
       if (SKIP_LINK.test(title)) continue;
+      // Na Hotmart, modulo e aula compartilham /content/<hash>. O texto do
+      // cartao e a diferenca observavel: "Modulo 4 aulas 0% ... Acessar".
+      if (MODULE_CARD.test(title)) kind = 'module';
+
+      const key = kind + '|' + url.pathname + (url.search || '');
+      if (seen.has(key)) continue;
 
       seen.add(key);
-      const entry = { el: node, url: url.href, title };
+      const entry = {
+        el: node,
+        url: url.href,
+        title: kind === 'module' && MODULE_CARD.test(title) ? moduleCardTitle(title) : title
+      };
       if (kind === 'module') modules.push(entry);
       else lessons.push(entry);
     }

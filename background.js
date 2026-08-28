@@ -7,9 +7,9 @@
  *  - orquestrar o download (executado no documento offscreen) e expor o
  *    progresso para o popup.
  *
- * Somente URLs de playlist sao lidas. Nenhum cabecalho, cookie ou token da
- * pagina e lido ou armazenado; quando o portal exige autenticacao, o proprio
- * navegador pode usar a sessao corrente. DRM e criptografia sao recusados.
+ * Credenciais da pagina nunca sao persistidas. Para anexos da Hotmart, o token
+ * da sessao e usado transitoriamente na chamada oficial e descartado logo em
+ * seguida. DRM e criptografia continuam recusados.
  */
 
 import {
@@ -598,7 +598,7 @@ async function getLessonTitle(tabId) {
   }
 
   try {
-    const [injection] = await chrome.scripting.executeScript({
+    const injections = await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
         const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
@@ -1095,9 +1095,53 @@ async function closeOffscreenIfIdle() {
  * ------------------------------------------------------------------ */
 
 async function scanCourse(tabId) {
+  let scanTabId = tabId;
+  let temporaryTabId = null;
   try {
+    // Na grade de modulos da Hotmart ainda nao existe a navegacao completa de
+    // aulas. Abre o primeiro modulo numa aba INATIVA e escaneia ali, sem
+    // clicar, navegar ou alterar a pagina que o usuario esta usando.
+    const sourceTab = await chrome.tabs.get(tabId).catch(() => null);
+    if (/\/club\/[^/]+\/products\/[^/]+\/content\//i.test(sourceTab?.url || '')) {
+      const [moduleLinkInjection] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const moduleCard = /^m[oó]dulo\s+\d+\s+aulas?\s+\d{1,3}%(?:\s|$)/i;
+          for (const el of document.querySelectorAll(
+            'a[href], [data-href], [data-url], [data-link], [data-to], [data-path]'
+          )) {
+            if (!moduleCard.test(clean(el.innerText || el.textContent))) continue;
+            const raw = el.getAttribute('href') || el.getAttribute('data-href') ||
+              el.getAttribute('data-url') || el.getAttribute('data-link') ||
+              el.getAttribute('data-to') || el.getAttribute('data-path');
+            try {
+              const url = new URL(raw, location.href);
+              if (url.origin === location.origin) return url.href;
+            } catch { /* atributo invalido */ }
+          }
+          return null;
+        }
+      });
+      const firstModuleUrl = moduleLinkInjection?.result || null;
+      const scanUrl = firstModuleUrl || sourceTab.url;
+      if (scanUrl) {
+        const temporary = await chrome.tabs.create({ url: scanUrl, active: false });
+        temporaryTabId = temporary.id;
+        scanTabId = temporary.id;
+        for (let attempt = 0; attempt < 50; attempt++) {
+          const state = await chrome.tabs.get(scanTabId).catch(() => null);
+          if (!state) throw new Error('a aba temporaria da varredura foi fechada');
+          if (state.status === 'complete') break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        // Aguarda a Hotmart hidratar a navegacao React depois do load.
+        await new Promise((resolve) => setTimeout(resolve, 700));
+      }
+    }
+
     const [injection] = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId: scanTabId },
       files: ['scan-course.js']
     });
     const result = injection && injection.result;
@@ -1115,7 +1159,7 @@ async function scanCourse(tabId) {
       );
     if (!result || !result.ok || isEduzzTrail || isHotmartContent) {
       const [dataInjection] = await chrome.scripting.executeScript({
-        target: { tabId },
+        target: { tabId: scanTabId },
         files: ['scan-page-data.js'],
         world: 'MAIN'
       });
@@ -1125,7 +1169,14 @@ async function scanCourse(tabId) {
       // Os dois scanners veem partes diferentes na Turing Academy: o DOM
       // comum encontra as aulas e os dados React encontram "Extras da trilha".
       // Escolher apenas a lista maior descartava exatamente os quatro bônus.
-      const modules = result.modules.map((module) => ({
+      const genericModule = (title) =>
+        /^(?:aulas|todos os conte[uú]dos|all contents?)$/i.test(String(title || '').trim());
+      const resultHasNamedModules = result.modules.some((module) => !genericModule(module.title));
+      const dataHasNamedModules = dataResult.modules.some((module) => !genericModule(module.title));
+      // Se o DOM viu apenas o agrupador lazy da Hotmart e os dados React
+      // conhecem os modulos reais, estes devem definir a estrutura do curso.
+      const baseModules = dataHasNamedModules && !resultHasNamedModules ? [] : result.modules;
+      const modules = baseModules.map((module) => ({
         ...module,
         lessons: module.lessons.map((lesson) => ({ ...lesson }))
       }));
@@ -1178,6 +1229,10 @@ async function scanCourse(tabId) {
     };
   } catch (error) {
     return { ok: false, error: error.message };
+  } finally {
+    if (temporaryTabId !== null) {
+      await chrome.tabs.remove(temporaryTabId).catch(() => {});
+    }
   }
 }
 
@@ -1190,7 +1245,7 @@ async function scanCourse(tabId) {
  * ------------------------------------------------------------------ */
 
 const COURSE_KEY = 'courses';
-const COURSE_SCAN_SCHEMA = 2;
+const COURSE_SCAN_SCHEMA = 5;
 
 async function getCourseCache() {
   try {
@@ -1273,6 +1328,7 @@ async function courseScan(tabId, { force = false } = {}) {
  * ------------------------------------------------------------------ */
 
 const DONE_KEY = 'completed';
+const MATERIALS_SCAN_VERSION = 9;
 
 async function getCompleted() {
   try {
@@ -1296,7 +1352,29 @@ async function markCompleted(lessonUrl, info) {
     container: info.container || null,
     remuxed: Boolean(info.remuxed),
     validatedBonus: Boolean(info.validatedBonus),
+    materialsCheckedAt: info.materialsCheckedAt || null,
+    materialsScanVersion: Number(info.materialsScanVersion || 0),
+    materialCount: Number(info.materialCount || 0),
     at: Date.now()
+  };
+  await chrome.storage.local.set({ [DONE_KEY]: all }).catch(() => {});
+}
+
+async function markMaterialsChecked(lessonUrl, materials, expectedPath = '') {
+  if (!materials?.scanComplete) return;
+  const all = await getCompleted();
+  if (!all[lessonUrl] && expectedPath) {
+    const previous = Object.values(all).find((entry) =>
+      entry?.path && downloadMatchesLesson(entry.path, expectedPath)
+    );
+    if (previous) all[lessonUrl] = { ...previous };
+  }
+  if (!all[lessonUrl]) return;
+  all[lessonUrl] = {
+    ...all[lessonUrl],
+    materialsCheckedAt: Date.now(),
+    materialsScanVersion: MATERIALS_SCAN_VERSION,
+    materialCount: Number(materials?.attachmentCount || 0)
   };
   await chrome.storage.local.set({ [DONE_KEY]: all }).catch(() => {});
 }
@@ -1489,6 +1567,9 @@ async function reconcileCourseDownloads(course) {
       container: /\.mp4$/i.test(savedPath) ? 'mp4' : (/\.ts$/i.test(savedPath) ? 'ts' : null),
       remuxed: Boolean(remuxedPath),
       validatedBonus: Boolean(lesson.isBonus),
+      materialsCheckedAt: previous?.materialsCheckedAt || null,
+      materialsScanVersion: Number(previous?.materialsScanVersion || 0),
+      materialCount: Number(previous?.materialCount || 0),
       at: previous?.at || Date.now()
     };
   }
@@ -1607,13 +1688,13 @@ async function saveChromeResource(url, filename) {
  * registra links, anexos e repositórios GitHub. React props são consultadas no
  * MAIN world para alcançar botões de arquivo que não usam <a href>.
  */
-async function capturePageResources(tabId, expectedTitle) {
+async function capturePageResources(tabId, expectedTitle, { materialsOnly = false } = {}) {
   try {
-    const [injection] = await chrome.scripting.executeScript({
-      target: { tabId },
+    const injections = await chrome.scripting.executeScript({
+      target: { tabId, ...(materialsOnly ? { allFrames: true } : {}) },
       world: 'MAIN',
-      args: [expectedTitle],
-      func: (wantedTitle) => {
+      args: [expectedTitle, materialsOnly],
+      func: (wantedTitle, restrictToMaterials) => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
         const normalized = (value) => clean(value).toLocaleLowerCase('pt-BR');
         const wanted = normalized(wantedTitle);
@@ -1621,6 +1702,19 @@ async function capturePageResources(tabId, expectedTitle) {
           if (!el || !el.isConnected) return false;
           const style = getComputedStyle(el);
           return style.display !== 'none' && style.visibility !== 'hidden';
+        };
+        const deepElements = (root) => {
+          const found = [];
+          const visit = (scope) => {
+            let elements = [];
+            try { elements = [...scope.querySelectorAll('*')]; } catch { return; }
+            for (const el of elements) {
+              found.push(el);
+              if (el.shadowRoot) visit(el.shadowRoot);
+            }
+          };
+          visit(root);
+          return found;
         };
 
         const titleCandidates = [];
@@ -1729,14 +1823,52 @@ async function capturePageResources(tabId, expectedTitle) {
           attachments.set(href, { url: href, name: clean(label) || fromPath || 'Anexo' });
         };
 
-        for (const el of scope.querySelectorAll(
+        const allPageElements = deepElements(document);
+        const materialMarkers = allPageElements.filter((el) => {
+          if (!visible(el)) return false;
+          const label = clean(el.innerText || el.textContent || el.getAttribute?.('aria-label'));
+          return /^materiais?\s*\d*$/i.test(label);
+        });
+        const materialRows = allPageElements.filter((el) => {
+          if (!visible(el)) return false;
+          const label = clean(el.innerText || el.textContent || el.getAttribute?.('aria-label'));
+          const rect = el.getBoundingClientRect();
+          return rect.width > 180 && rect.height <= 220 && label.length <= 500 &&
+            /(?:\.(?:pdf|docx?|xlsx?|pptx?|csv|zip|rar|7z)\b|\bPDF\b|\b\d+(?:[.,]\d+)?\s*(?:KB|MB)\b)/i.test(label);
+        });
+        const materialElements = new Set();
+        for (const row of materialRows) {
+          materialElements.add(row);
+          for (const child of deepElements(row)) materialElements.add(child);
+          for (let node = row.parentElement, depth = 0; node && depth < 3; node = node.parentElement, depth++) {
+            materialElements.add(node);
+          }
+        }
+        const deepScopeElements = restrictToMaterials
+          ? [...materialElements]
+          : deepElements(scope);
+        for (const el of deepScopeElements.filter((candidate) => candidate.matches?.(
           'a[href], [download], [data-download-url], [data-file-url], [data-href], [data-url], iframe[src], embed[src], object[data]'
-        )) {
+        ))) {
           const label = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.title);
           const raw = el.getAttribute('href') || el.getAttribute('data-download-url') ||
             el.getAttribute('data-file-url') || el.getAttribute('data-href') || el.getAttribute('data-url') ||
             el.getAttribute('src') || el.getAttribute('data');
           addUrl(raw, el.getAttribute('download') || label, el.hasAttribute('download'));
+        }
+        // Web Components podem guardar o arquivo em um atributo menos
+        // previsivel do host. Inspeciona URLs sem depender do nome exato.
+        for (const el of deepScopeElements) {
+          let attributes = [];
+          try { attributes = [...el.attributes]; } catch { /* no protegido */ }
+          for (const attribute of attributes) {
+            if (!/^https?:\/\//i.test(attribute.value || '')) continue;
+            addUrl(
+              attribute.value,
+              clean(el.innerText || el.textContent || el.getAttribute?.('aria-label') || attribute.name),
+              /download|file|arquivo|anexo|material/i.test(attribute.name)
+            );
+          }
         }
         for (const match of text.matchAll(/https?:\/\/[^\s<>()\[\]"']+/gi)) {
           addUrl(match[0].replace(/[.,;:!?]+$/, ''), match[0]);
@@ -1745,7 +1877,7 @@ async function capturePageResources(tabId, expectedTitle) {
         // URLs escondidas nas props dos botões React (caso comum em ARQUIVO).
         const seen = new WeakSet();
         const queue = [];
-        for (const el of scope.querySelectorAll('button, [role="button"], a, [class*="download" i], [class*="anexo" i]')) {
+        for (const el of deepScopeElements) {
           let propertyNames = [];
           try { propertyNames = Object.getOwnPropertyNames(el); } catch { /* nó protegido */ }
           for (const key of propertyNames) {
@@ -1760,10 +1892,19 @@ async function capturePageResources(tabId, expectedTitle) {
           visited++;
           let entries = [];
           try { entries = Object.entries(value); } catch { continue; }
+          const objectFilename = entries.find(([key, child]) =>
+            typeof child === 'string' &&
+            /^(?:fileName|filename|name|title|nome)$/i.test(key) &&
+            /\.(?:pdf|docx?|xlsx?|pptx?|csv|zip|rar|7z|txt)$/i.test(child.trim())
+          )?.[1] || '';
           for (const [key, child] of entries) {
             if (typeof child === 'string') {
-              if (/url|href|download|file|arquivo|anexo/i.test(key) || /^https?:\/\//i.test(child)) {
-                addUrl(child, key, /download|file|arquivo|anexo/i.test(key));
+              // Nomes como `fileName: apostila.pdf` não são endereços. Se
+              // resolvidos contra location.href, viram uma rota HTML do Club.
+              // Dados React só entram como recurso quando trazem URL absoluta.
+              if (/^https?:\/\//i.test(child)) {
+                const explicitMaterialUrl = /(?:download|attachment|anexo|material).*(?:url|href)|(?:url|href).*(?:download|attachment|anexo|material)|^(?:file|fileUrl|arquivo|anexo|attachment|material)$/i.test(key);
+                addUrl(child, objectFilename || key, explicitMaterialUrl);
               }
             } else if (child && typeof child === 'object' &&
                        !/^(_owner|return|stateNode|child|sibling|alternate)$/i.test(key)) {
@@ -1777,13 +1918,35 @@ async function capturePageResources(tabId, expectedTitle) {
           matchedTitle: Boolean(titleElement),
           sourceUrl: location.href,
           text,
+          materialsContext: materialMarkers.length > 0 && materialRows.length > 0,
+          materialRowCount: materialRows.length,
           links: [...links.values()].slice(0, 300),
           attachments: [...attachments.values()].slice(0, 30),
           repositories: [...repositories.values()].slice(0, 20)
         };
       }
     });
-    return injection?.result || null;
+    const captures = injections.map((entry) => entry?.result).filter(Boolean);
+    if (!captures.length) return null;
+    const eligible = materialsOnly
+      ? captures.filter((capture) => capture.materialsContext)
+      : captures;
+    if (!eligible.length && materialsOnly) {
+      return { text: '', links: [], attachments: [], repositories: [], materialsContext: false };
+    }
+    const preferred = eligible.slice().sort((left, right) =>
+      Number(Boolean(right.matchedTitle)) - Number(Boolean(left.matchedTitle)) ||
+      Number((right.attachments || []).length) - Number((left.attachments || []).length) ||
+      String(right.text || '').length - String(left.text || '').length
+    )[0];
+    const unique = (values, key) => [...new Map(values.map((value) => [value?.[key], value])).values()]
+      .filter((value) => value?.[key]);
+    return {
+      ...preferred,
+      links: unique(eligible.flatMap((capture) => capture.links || []), 'url').slice(0, 300),
+      attachments: unique(eligible.flatMap((capture) => capture.attachments || []), 'url').slice(0, 30),
+      repositories: unique(eligible.flatMap((capture) => capture.repositories || []), 'url').slice(0, 20)
+    };
   } catch (error) {
     return { error: error.message, text: '', links: [], attachments: [], repositories: [] };
   }
@@ -1831,30 +1994,31 @@ function resourceFilename(rawName, fallback, sourceUrl = '') {
   return sanitizeFilename(name, fallback);
 }
 
-async function probeResourceExtension(url) {
+async function probeResourceMetadata(url) {
   try {
     const response = await fetch(url, { method: 'HEAD', credentials: 'include', cache: 'no-store' });
-    if (!response.ok) return '';
+    if (!response.ok) return { extension: '', rejected: false, contentType: '' };
     const disposition = response.headers.get('content-disposition') || '';
     const encoded = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
     const plain = disposition.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1];
     const filename = decodeURIComponent(encoded || plain || '').trim();
     const byName = filename.match(/\.[a-z0-9]{1,8}$/i)?.[0];
-    if (byName) return byName;
     const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    if (/application\/pdf/.test(contentType)) return '.pdf';
-    if (/wordprocessingml/.test(contentType)) return '.docx';
-    if (/msword/.test(contentType)) return '.doc';
-    if (/spreadsheetml/.test(contentType)) return '.xlsx';
-    if (/presentationml/.test(contentType)) return '.pptx';
-    if (/text\/plain/.test(contentType)) return '.txt';
-    return '';
+    const rejected = /(?:text\/html|application\/(?:xhtml\+xml|json))/.test(contentType);
+    let extension = byName || '';
+    if (!extension && /application\/pdf/.test(contentType)) extension = '.pdf';
+    if (!extension && /wordprocessingml/.test(contentType)) extension = '.docx';
+    if (!extension && /msword/.test(contentType)) extension = '.doc';
+    if (!extension && /spreadsheetml/.test(contentType)) extension = '.xlsx';
+    if (!extension && /presentationml/.test(contentType)) extension = '.pptx';
+    if (!extension && /text\/plain/.test(contentType)) extension = '.txt';
+    return { extension, rejected, contentType };
   } catch {
-    return '';
+    return { extension: '', rejected: false, contentType: '' };
   }
 }
 
-async function saveCapturedResources(item, capture) {
+async function saveCapturedResources(item, capture, { attachmentsOnly = false } = {}) {
   if (!capture || capture.error) {
     return { ok: false, error: capture?.error || 'não foi possível ler o conteúdo da página' };
   }
@@ -1863,6 +2027,9 @@ async function saveCapturedResources(item, capture) {
   }
   const hasUsefulContent = capture.text || capture.links.length ||
     capture.attachments.length || capture.repositories.length;
+  if (attachmentsOnly && !capture.attachments.length) {
+    return { ok: true, downloadIds: [], warnings: [], attachmentCount: 0 };
+  }
   if (!hasUsefulContent) return { ok: false, error: 'a página não exibiu texto, links ou anexos' };
   if (item.kind === 'file' && !capture.attachments.length) {
     return { ok: false, error: 'o bônus é um arquivo, mas o link do anexo não foi encontrado' };
@@ -1889,10 +2056,19 @@ async function saveCapturedResources(item, capture) {
     let requestedName = item.kind === 'file' && capture.attachments.length === 1
       ? item.title
       : attachment.name;
+    const metadata = await probeResourceMetadata(attachment.url);
+    if (metadata.rejected) {
+      results.push({
+        type: 'attachment',
+        label: requestedName,
+        result: { ok: false, error: 'o endereço encontrado devolveu uma página HTML, não um material' }
+      });
+      continue;
+    }
     if (item.kind === 'file' && !/\.[a-z0-9]{1,8}$/i.test(
       resourceFilename(requestedName, '', attachment.url)
     )) {
-      requestedName += await probeResourceExtension(attachment.url);
+      requestedName += metadata.extension;
     }
     const name = uniqueName(requestedName, `Anexo ${index + 1}`, attachment.url);
     results.push({
@@ -1900,6 +2076,20 @@ async function saveCapturedResources(item, capture) {
       label: name,
       result: await saveChromeResource(attachment.url, `${item.path}/${name}`)
     });
+  }
+
+  if (attachmentsOnly) {
+    const saved = results.filter((entry) => entry.result.ok);
+    const firstSaved = saved[0];
+    return {
+      ok: true,
+      downloadIds: saved.map((entry) => entry.result.downloadId),
+      filename: firstSaved?.label || null,
+      savedPath: firstSaved?.result.download?.filename || null,
+      warnings: results.filter((entry) => !entry.result.ok)
+        .map((entry) => entry.result.error || `falha ao salvar ${entry.label}`),
+      attachmentCount: saved.length
+    };
   }
 
   if (item.kind === 'file') {
@@ -1947,6 +2137,605 @@ async function saveCapturedResources(item, capture) {
     filename: indexName,
     savedPath: indexResult.download?.filename || `${item.path}/${indexName}`,
     warnings: failed.map((entry) => `${entry.label}: ${entry.result.error}`)
+  };
+}
+
+/** Abre a aba Materiais da aula sem acionar o botao de download. */
+async function revealLessonMaterials(tabId) {
+  try {
+    const injections = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: () => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const deepElements = (root) => {
+          const found = [];
+          const visit = (scope) => {
+            let elements = [];
+            try { elements = [...scope.querySelectorAll('*')]; } catch { return; }
+            for (const el of elements) {
+              found.push(el);
+              if (el.shadowRoot) visit(el.shadowRoot);
+            }
+          };
+          visit(root);
+          return found;
+        };
+        const composedClickable = (start) => {
+          for (let node = start, depth = 0; node && depth < 10; depth++) {
+            if (node.matches?.('[role="tab"], button, a[href], [role="button"]')) return node;
+            node = node.parentElement || node.getRootNode?.().host || null;
+          }
+          return null;
+        };
+        const visible = (el) => {
+          const style = getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' &&
+            rect.width > 0 && rect.height > 0;
+        };
+        const candidates = deepElements(document)
+          .map((el) => ({
+            el,
+            text: clean(el.innerText || el.textContent || el.getAttribute('aria-label'))
+          }))
+          .filter(({ el, text }) => visible(el) && /^materiais?\s*\d*$/i.test(text))
+          .filter(({ el, text }) => ![...el.children].some((child) =>
+            clean(child.innerText || child.textContent) === text
+          ));
+        candidates.sort((a, b) => {
+          const aClickable = composedClickable(a.el) ? 0 : 1;
+          const bClickable = composedClickable(b.el) ? 0 : 1;
+          return aClickable - bClickable || a.text.length - b.text.length;
+        });
+        const match = candidates[0];
+        const target = composedClickable(match?.el) || match?.el;
+        if (!target) return { found: false, clicked: false };
+        const selected = target.getAttribute('aria-selected') === 'true' ||
+          target.getAttribute('data-state') === 'active';
+        if (!selected) target.click();
+        const count = Number(match.text.match(/\b(\d+)$/)?.[1] || 0);
+        return { found: true, clicked: !selected, expectedCount: count };
+      }
+    });
+    return injections.map((entry) => entry?.result).filter(Boolean)
+      .sort((left, right) => Number(Boolean(right.found)) - Number(Boolean(left.found)) ||
+        Number(right.expectedCount || 0) - Number(left.expectedCount || 0))[0] ||
+      { found: false, clicked: false };
+  } catch (error) {
+    return { found: false, clicked: false, error: error.message };
+  }
+}
+
+async function clickMaterialDownload(item, buttonIndex, { apiOnly = false } = {}) {
+  let listener = null;
+  let timer = null;
+  const created = new Promise((resolve) => {
+    listener = (download) => {
+      chrome.downloads.onCreated.removeListener(listener);
+      if (timer) clearTimeout(timer);
+      resolve(download);
+    };
+    chrome.downloads.onCreated.addListener(listener);
+    timer = setTimeout(() => {
+      chrome.downloads.onCreated.removeListener(listener);
+      resolve(null);
+    }, 10000);
+  });
+
+  let clickResult = null;
+  try {
+    const injections = await chrome.scripting.executeScript({
+      target: { tabId: batch.tabId, allFrames: true },
+      world: 'MAIN',
+      args: [buttonIndex, apiOnly],
+      func: async (wantedIndex, onlyApi) => {
+        const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const deepElements = (root) => {
+          const found = [];
+          const visit = (scope) => {
+            let elements = [];
+            try { elements = [...scope.querySelectorAll('*')]; } catch { return; }
+            for (const el of elements) {
+              found.push(el);
+              if (el.shadowRoot) visit(el.shadowRoot);
+            }
+          };
+          visit(root);
+          return found;
+        };
+        const visible = (el) => {
+          const style = getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' &&
+            rect.width > 0 && rect.height > 0;
+        };
+        const reactClickable = (start) => {
+          for (let node = start, depth = 0; node && depth < 7; node = node.parentElement, depth++) {
+            let names = [];
+            try { names = Object.getOwnPropertyNames(node); } catch { /* protegido */ }
+            for (const name of names) {
+              if (!name.startsWith('__reactProps$')) continue;
+              const props = node[name];
+              if (typeof props?.onClick === 'function' || typeof props?.onPress === 'function') {
+                return node;
+              }
+            }
+          }
+          return null;
+        };
+        const targets = [];
+        const seen = new Set();
+        const allElements = deepElements(document);
+        const labelOf = (el) => {
+          let before = '';
+          let after = '';
+          try {
+            before = getComputedStyle(el, '::before').content || '';
+            after = getComputedStyle(el, '::after').content || '';
+          } catch { /* pseudo-elemento indisponivel */ }
+          return clean([
+            el.innerText, el.textContent, el.getAttribute?.('aria-label'), el.title,
+            el.value, before.replace(/^['"]|['"]$/g, ''), after.replace(/^['"]|['"]$/g, '')
+          ].filter(Boolean).join(' '));
+        };
+
+        // Usa o mesmo fluxo da aplicação Hotmart quando o Web Component não
+        // expõe o botão/URL no DOM. O token é usado somente nesta execução no
+        // contexto da página; nunca é retornado, persistido ou enviado ao host.
+        const tryHotmartAttachmentApi = async () => {
+          const reactQueue = [];
+          for (const el of allElements) {
+            let names = [];
+            try { names = Object.getOwnPropertyNames(el); } catch { /* protegido */ }
+            for (const name of names) {
+              if (name.startsWith('__reactProps$')) reactQueue.push({ value: el[name], depth: 0 });
+            }
+          }
+          const seenObjects = new WeakSet();
+          let token = '';
+          let visited = 0;
+          while (reactQueue.length && visited < 12000 && !token) {
+            const { value, depth } = reactQueue.shift();
+            if (!value || typeof value !== 'object' || seenObjects.has(value) || depth > 9) continue;
+            seenObjects.add(value);
+            visited++;
+            let entries = [];
+            try { entries = Object.entries(value); } catch { continue; }
+            for (const [key, child] of entries) {
+              if (/^(?:token|accessToken|access_token)$/i.test(key) && typeof child === 'string' &&
+                  child.length > 40) {
+                token = child;
+                break;
+              }
+              if (child && typeof child === 'object' &&
+                  !/^(_owner|return|stateNode|child|sibling|alternate)$/i.test(key)) {
+                reactQueue.push({ value: child, depth: depth + 1 });
+              }
+            }
+          }
+          if (!token) return { ok: false, reason: 'token-not-found' };
+
+          const parts = location.pathname.split('/').filter(Boolean);
+          const productAt = parts.findIndex((part) => part.toLowerCase() === 'products');
+          const contentAt = parts.findIndex((part) => part.toLowerCase() === 'content');
+          const productId = productAt >= 0 ? parts[productAt + 1] : '';
+          const lessonId = contentAt >= 0 ? parts[contentAt + 1] : parts.at(-1);
+          if (!productId || !lessonId) return { ok: false, reason: 'lesson-id-not-found' };
+          const headers = {
+            Accept: 'application/json',
+            Authorization: `Bearer ${token}`,
+            'x-product-id': productId,
+            'x-app-name': 'app-club-consumer_v1.364.1_production'
+          };
+          let pageMeta = null;
+          try {
+            const pageResponse = await fetch(
+              `https://api-club-course-consumption-gateway-ga.cb.hotmart.com/v2/web/lessons/${encodeURIComponent(lessonId)}`,
+              { credentials: 'include', headers }
+            );
+            if (pageResponse.ok) {
+              const page = await pageResponse.json();
+              const contentNode = document.createElement('div');
+              contentNode.innerHTML = String(page?.content || '');
+              const contentText = clean(contentNode.textContent || contentNode.innerText || '');
+              pageMeta = {
+                hasMedia: Boolean(page?.hasMedia),
+                type: String(page?.type || ''),
+                hasContent: Boolean(contentText),
+                contentText: contentText.slice(0, 500000)
+              };
+            }
+          } catch {
+            /* conteúdo complementar ainda pode funcionar */
+          }
+          const complementaryResponse = await fetch(
+            `https://api-club-course-consumption-gateway-ga.cb.hotmart.com/v1/pages/${encodeURIComponent(lessonId)}/complementary-content`,
+            { credentials: 'include', headers }
+          );
+          if (!complementaryResponse.ok) {
+            return {
+              ok: false,
+              metadataReached: Boolean(pageMeta),
+              pageMeta,
+              reason: `complementary-api-${complementaryResponse.status}`
+            };
+          }
+          const complementary = await complementaryResponse.json();
+          const candidates = Array.isArray(complementary?.attachments)
+            ? complementary.attachments
+              .filter((entry) => entry?.fileMembershipId && entry?.fileName)
+              .map((entry) => ({
+                id: String(entry.fileMembershipId),
+                name: clean(entry.fileName),
+                size: Number(entry.fileSize || 0)
+              }))
+            : [];
+          if (onlyApi) {
+            return {
+              ok: false,
+              apiReached: true,
+              metadataReached: Boolean(pageMeta),
+              pageMeta,
+              reason: 'api-check-only',
+              count: candidates.length
+            };
+          }
+          const attachment = candidates[wantedIndex];
+          if (!attachment) return {
+            ok: false,
+            apiReached: true,
+            reason: 'attachment-id-not-found',
+            count: candidates.length
+          };
+          // O service worker possui host_permissions e conclui esta chamada
+          // fora do CORS da página. A credencial fica apenas em memória.
+          return {
+            ok: false,
+            apiHandoff: true,
+            count: candidates.length,
+            attachment,
+            productId,
+            token
+          };
+        };
+        let apiFailure = '';
+        try {
+          const apiResult = await tryHotmartAttachmentApi();
+          if (apiResult.ok) {
+            return { clicked: true, count: apiResult.count, method: 'hotmart-api' };
+          }
+          if (apiResult.apiHandoff) {
+            return {
+              clicked: false,
+              apiHandoff: true,
+              count: apiResult.count,
+              attachment: apiResult.attachment,
+              productId: apiResult.productId,
+              token: apiResult.token
+            };
+          }
+          apiFailure = apiResult.reason || 'api-unavailable';
+          if (onlyApi && apiResult.apiReached) {
+            return {
+              clicked: false,
+              apiChecked: true,
+              metadataChecked: Boolean(apiResult.metadataReached),
+              pageMeta: apiResult.pageMeta || null,
+              attachmentCount: Number(apiResult.count || 0),
+              count: Number(apiResult.count || 0),
+              apiFailure
+            };
+          }
+          if (onlyApi && apiResult.metadataReached) {
+            return {
+              clicked: false,
+              apiChecked: false,
+              metadataChecked: true,
+              pageMeta: apiResult.pageMeta || null,
+              attachmentCount: 0,
+              count: 0,
+              apiFailure
+            };
+          }
+        } catch (error) {
+          apiFailure = `api-exception-${error?.message || 'unknown'}`;
+          /* o fallback visual abaixo continua disponível */
+        }
+        const materialsTabFound = allElements.some((el) =>
+          visible(el) && /^materiais?\s*\d*$/i.test(labelOf(el))
+        );
+        if (!materialsTabFound) {
+          return {
+            clicked: false,
+            count: 0,
+            shadowRoots: allElements.filter((el) => el.shadowRoot).length,
+            fileRows: 0,
+            apiFailure
+          };
+        }
+        const matches = allElements
+          .map((el) => ({
+            el,
+            label: labelOf(el)
+          }))
+          .filter(({ el, label }) => visible(el) && /\b(?:download|baixar)\b/i.test(label))
+          .sort((a, b) => a.label.length - b.label.length);
+        for (const { el } of matches) {
+          const target = el.closest('button, a, [role="button"]') || reactClickable(el) || el;
+          if (seen.has(target)) continue;
+          seen.add(target);
+          targets.push(target);
+        }
+
+        // Alguns Web Components desenham "Download" sem texto acessivel. A
+        // linha do arquivo ainda expoe nome/extensao/tamanho; nesse caso usa o
+        // controle clicavel mais a direita, onde fica a acao na interface.
+        if (!targets.length) {
+          const fileRows = allElements
+            .map((el) => ({ el, label: labelOf(el), rect: el.getBoundingClientRect() }))
+            .filter(({ el, label, rect }) => visible(el) && rect.width > 180 &&
+              /(?:\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|7z)\b|\bPDF\b|\b\d+(?:[.,]\d+)?\s*(?:KB|MB)\b)/i.test(label))
+            .sort((a, b) => a.label.length - b.label.length ||
+              (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+          for (const row of fileRows) {
+            const descendants = deepElements(row.el)
+              .filter(visible)
+              .map((el) => ({
+                el,
+                clickable: el.matches?.('button, a, [role="button"], [tabindex]') ||
+                  Boolean(reactClickable(el)),
+                rect: el.getBoundingClientRect()
+              }))
+              .filter(({ clickable, rect }) => clickable && rect.width > 0 && rect.height > 0)
+              .sort((a, b) => b.rect.right - a.rect.right);
+            let target = descendants[0]?.el || null;
+            if (!target) {
+              const x = Math.max(row.rect.left + 1, row.rect.right - 24);
+              const y = row.rect.top + row.rect.height / 2;
+              target = document.elementFromPoint(x, y);
+              while (target?.shadowRoot) {
+                const deeper = target.shadowRoot.elementFromPoint(x, y);
+                if (!deeper || deeper === target) break;
+                target = deeper;
+              }
+            }
+            target = target && (reactClickable(target) ||
+              target.closest?.('button, a, [role="button"], [tabindex]') || target);
+            if (!target || seen.has(target)) continue;
+            seen.add(target);
+            targets.push(target);
+          }
+        }
+        const target = targets[wantedIndex];
+        if (!target) {
+          return {
+            clicked: false,
+            count: targets.length,
+            shadowRoots: allElements.filter((el) => el.shadowRoot).length,
+            fileRows: allElements.filter((el) => /\bPDF\b|\.pdf\b/i.test(labelOf(el))).length,
+            apiFailure
+          };
+        }
+        target.click();
+        return { clicked: true, count: targets.length };
+      }
+    });
+    clickResult = injections.find((entry) => entry?.result?.clicked)?.result ||
+      injections.map((entry) => entry?.result).filter(Boolean)
+        .sort((a, b) => Number(Boolean(b.apiHandoff)) - Number(Boolean(a.apiHandoff)) ||
+          Number(Boolean(b.apiChecked)) - Number(Boolean(a.apiChecked)) ||
+          Number(Boolean(b.metadataChecked)) - Number(Boolean(a.metadataChecked)) ||
+          Number(b.count || 0) - Number(a.count || 0))[0] || null;
+  } catch {
+    /* tratado abaixo */
+  }
+
+  if (clickResult?.apiChecked) {
+    if (listener) chrome.downloads.onCreated.removeListener(listener);
+    if (timer) clearTimeout(timer);
+    return {
+      ok: true,
+      apiChecked: true,
+      metadataChecked: Boolean(clickResult.metadataChecked),
+      pageMeta: clickResult.pageMeta || null,
+      attachmentCount: Number(clickResult.attachmentCount || 0)
+    };
+  }
+
+  if (clickResult?.metadataChecked) {
+    if (listener) chrome.downloads.onCreated.removeListener(listener);
+    if (timer) clearTimeout(timer);
+    return {
+      ok: true,
+      apiChecked: false,
+      metadataChecked: true,
+      pageMeta: clickResult.pageMeta || null,
+      attachmentCount: 0
+    };
+  }
+
+  if (clickResult?.apiHandoff) {
+    if (listener) chrome.downloads.onCreated.removeListener(listener);
+    if (timer) clearTimeout(timer);
+    try {
+      const headers = {
+        Accept: 'application/json',
+        Authorization: `Bearer ${clickResult.token}`,
+        'x-product-id': String(clickResult.productId || ''),
+        'x-app-name': 'app-club-consumer_v1.364.1_production'
+      };
+      const response = await fetch(
+        `https://api-club-hot-club-api.cb.hotmart.com/rest/v3/attachment/` +
+          `${encodeURIComponent(clickResult.attachment.id)}/download`,
+        { headers, credentials: 'include' }
+      );
+      if (!response.ok) {
+        return { ok: false, error: `API de download respondeu ${response.status}` };
+      }
+      const data = await response.json();
+      let downloadUrl = String(data?.directDownloadUrl || '');
+      if (!downloadUrl && data?.lambdaUrl && data?.token) {
+        const lambdaResponse = await fetch(String(data.lambdaUrl), {
+          headers: { token: String(data.token) }
+        });
+        if (!lambdaResponse.ok) {
+          return { ok: false, error: `API intermediária respondeu ${lambdaResponse.status}` };
+        }
+        const raw = await lambdaResponse.text();
+        try {
+          const parsed = JSON.parse(raw);
+          downloadUrl = typeof parsed === 'string'
+            ? parsed
+            : String(parsed?.url || parsed?.downloadUrl || parsed?.directDownloadUrl || '');
+        } catch {
+          downloadUrl = raw.trim();
+        }
+      }
+      if (!/^https?:\/\//i.test(downloadUrl)) {
+        return { ok: false, error: 'a API não devolveu a URL final do material' };
+      }
+      const filename = sanitizeFilename(clickResult.attachment.name, `Material ${buttonIndex + 1}`);
+      const saved = await saveChromeResource(downloadUrl, `${item.path}/${filename}`);
+      if (!saved.ok) return { ok: false, error: saved.error || 'falha ao salvar o material' };
+      return {
+        ok: true,
+        downloadId: saved.downloadId,
+        filename,
+        savedPath: saved.download?.filename || `${item.path}/${filename}`,
+        warning: null
+      };
+    } catch (error) {
+      return { ok: false, error: `falha na API de materiais: ${error.message}` };
+    }
+  }
+
+  if (!clickResult?.clicked) {
+    if (listener) chrome.downloads.onCreated.removeListener(listener);
+    if (timer) clearTimeout(timer);
+    return {
+      ok: false,
+      error: `botão Download não encontrado na aba Materiais ` +
+        `(${Number(clickResult?.count || 0)} candidato(s), ` +
+        `${Number(clickResult?.shadowRoots || 0)} Shadow DOM, ` +
+        `${Number(clickResult?.fileRows || 0)} linha(s) de arquivo, ` +
+        `API: ${String(clickResult?.apiFailure || 'indisponível')})`
+    };
+  }
+
+  const download = await created;
+  if (!download?.id) return { ok: false, error: 'o botão Download não iniciou um arquivo' };
+  const finished = await waitForChromeDownload(download.id);
+  if (!finished.ok) return { ok: false, error: finished.error || 'o material não terminou de baixar' };
+
+  const originalPath = finished.download?.filename || download.filename;
+  const moved = await sendNative({
+    action: 'move-to-relative',
+    file: originalPath,
+    directory: item.path
+  });
+  return {
+    ok: true,
+    downloadId: download.id,
+    filename: String(moved.ok && moved.output ? moved.output : originalPath).split(/[\\/]/).pop(),
+    savedPath: moved.ok && moved.output ? moved.output : originalPath,
+    warning: moved.ok ? null : `material salvo fora da pasta da aula: ${moved.error || 'host indisponível'}`
+  };
+}
+
+async function clickMaterialDownloads(item, expectedCount) {
+  const saved = [];
+  const warnings = [];
+  for (let index = 0; index < Math.max(1, expectedCount || 1); index++) {
+    if (batchCanceled()) break;
+    item.phase = `Baixando material ${index + 1}…`;
+    saveBatch();
+    const result = await clickMaterialDownload(item, index);
+    if (!result.ok) {
+      warnings.push(result.error);
+      break;
+    }
+    saved.push(result);
+    if (result.warning) warnings.push(result.warning);
+  }
+  return {
+    ok: saved.length > 0,
+    scanComplete: saved.length >= Math.max(1, expectedCount || 1),
+    materialsTabFound: true,
+    attachmentCount: saved.length,
+    downloadIds: saved.map((entry) => entry.downloadId),
+    filename: saved[0]?.filename || null,
+    savedPath: saved[0]?.savedPath || null,
+    warnings,
+    error: saved.length ? null : warnings[0]
+  };
+}
+
+/** Salva somente os anexos da aula; texto e video ficam no fluxo principal. */
+async function saveLessonMaterials(item) {
+  item.phase = 'Verificando materiais…';
+  saveBatch();
+  // A API da própria Hotmart é a fonte primária. A interface visual pode não
+  // renderizar a aba/linha em aulas abertas em segundo plano.
+  const apiCheck = await clickMaterialDownload(item, 0, { apiOnly: true });
+  if (apiCheck.apiChecked) {
+    const count = Number(apiCheck.attachmentCount || 0);
+    if (count > 0) return clickMaterialDownloads(item, count);
+    return {
+      ok: true,
+      scanComplete: true,
+      materialsTabFound: false,
+      attachmentCount: 0,
+      downloadIds: [],
+      warnings: []
+    };
+  }
+  let revealed = { found: false, clicked: false };
+  // A rota muda antes de a Hotmart terminar de renderizar as abas da aula.
+  // Nao concluir "sem materiais" a partir desse estado intermediario.
+  for (let attempt = 0; attempt < 24; attempt++) {
+    revealed = await revealLessonMaterials(batch.tabId);
+    if (revealed.found) break;
+    await delay(250);
+  }
+  if (!revealed.found) {
+    return {
+      ok: true, scanComplete: true, materialsTabFound: false,
+      attachmentCount: 0, downloadIds: [], warnings: []
+    };
+  }
+  let capture = null;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    await delay(attempt === 0 ? 500 : 400);
+    if (attempt > 0 && attempt % 5 === 0) {
+      revealed = await revealLessonMaterials(batch.tabId);
+    }
+    capture = await capturePageResources(batch.tabId, item.title, { materialsOnly: true });
+    if ((capture?.attachments || []).length || Number(capture?.materialRowCount || 0) > 0) break;
+  }
+  if (!(capture?.attachments || []).length) {
+    return clickMaterialDownloads(item, revealed.expectedCount);
+  }
+  const saved = await saveCapturedResources(item, capture, { attachmentsOnly: true });
+  return {
+    ...saved,
+    scanComplete: Boolean(saved.ok),
+    materialsTabFound: true
+  };
+}
+
+async function addLessonMaterials(item, completedInfo) {
+  const materials = await saveLessonMaterials(item);
+  const warnings = materials.ok
+    ? (materials.warnings || [])
+    : [materials.error || 'não foi possível salvar os materiais'];
+  if (warnings.length) item.error = warnings.join(' · ');
+  item.materialCount = Number(materials.attachmentCount || 0);
+  return {
+    ...completedInfo,
+    materialsCheckedAt: materials.scanComplete ? Date.now() : null,
+    materialsScanVersion: materials.scanComplete ? MATERIALS_SCAN_VERSION : null,
+    materialCount: item.materialCount
   };
 }
 
@@ -2119,6 +2908,7 @@ async function navigateToLesson(tabId, lessonUrl, lessonTitle, { byTitleOnly = f
 
 async function waitForTabLoad(tabId, expectedUrl, timeoutMs = PAGE_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
+  let domReadySince = 0;
   await delay(250); // deixa a navegacao comecar antes de ler o status
   const expected = (() => {
     try { return new URL(expectedUrl); } catch { return null; }
@@ -2135,6 +2925,24 @@ async function waitForTabLoad(tabId, expectedUrl, timeoutMs = PAGE_TIMEOUT_MS) {
         // `complete` antecede a hidratacao do React e a criacao do iframe.
         await delay(900);
         return true;
+      }
+      if (correctPage) {
+        // Alguns Web Components/iframes da Hotmart mantêm o status da aba em
+        // `loading` indefinidamente, embora o documento principal já esteja
+        // pronto. Confirma o DOM por mais de um segundo antes de prosseguir.
+        const [injection] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => document.readyState !== 'loading' &&
+            Boolean(document.body && document.body.children.length)
+        }).catch(() => []);
+        if (injection?.result) {
+          if (!domReadySince) domReadySince = Date.now();
+          if (Date.now() - domReadySince >= 1000) return true;
+        } else {
+          domReadySince = 0;
+        }
+      } else {
+        domReadySince = 0;
       }
     } catch {
       return false; // aba fechada
@@ -3473,17 +4281,21 @@ async function runBatchItem(item) {
   item.error = null;
   saveBatch();
 
-  // Pular exige DUAS condicoes: constar no registro E o arquivo ainda estar la.
-  // Sem a segunda, apagar a pasta faz a fila passar reto por tudo.
-  // `force` vem da selecao explicita do usuario e vence as duas.
-  if (!item.force) {
-    const completed = await getCompleted();
-    const registro = completed[item.url];
-    if (await arquivoAindaExiste(registro)) {
+  // Uma aula salva, selecionada novamente, passa uma vez para buscar materiais
+  // que as versoes antigas ignoravam. O video existente nao e baixado de novo.
+  const completedBeforeRun = await getCompleted();
+  const registro = completedBeforeRun[item.url];
+  if (await arquivoAindaExiste(registro)) {
+    if (!item.force) {
       item.status = 'exists';
       item.savedPath = registro.path || null;
       item.phase = null;
       return;
+    }
+    if ((!item.kind || item.kind === 'video') &&
+        Number(registro.materialsScanVersion || 0) < MATERIALS_SCAN_VERSION) {
+      item.materialsOnly = true;
+      item.savedPath = registro.path || null;
     }
   }
 
@@ -3572,6 +4384,22 @@ async function runBatchItem(item) {
     return;
   }
   if (batchCanceled()) return;
+
+  if (item.materialsOnly) {
+    const materials = await saveLessonMaterials(item);
+    item.status = !materials.ok
+      ? 'error'
+      : materials.attachmentCount > 0 ? 'done' : 'exists';
+    item.phase = null;
+    item.materialCount = Number(materials.attachmentCount || 0);
+    if (materials.filename) item.filename = materials.filename;
+    if (materials.savedPath) item.savedPath = materials.savedPath;
+    item.error = materials.ok
+      ? ((materials.warnings || []).join(' · ') || null)
+      : (materials.error || 'não foi possível salvar os materiais');
+    await markMaterialsChecked(item.url, materials, item.path);
+    return;
+  }
 
   const emptyReason = await detectEmptyLesson(batch.tabId);
   if (emptyReason) {
@@ -3664,6 +4492,54 @@ async function runBatchItem(item) {
     ];
   }
   if (!stream) {
+    const pageInspection = await clickMaterialDownload(item, 0, { apiOnly: true });
+    const pageMeta = pageInspection?.pageMeta || null;
+    if (pageInspection?.metadataChecked && pageMeta?.hasMedia === false) {
+      item.phase = 'Salvando conteúdo sem vídeo…';
+      saveBatch();
+      const materials = await saveLessonMaterials(item);
+      if (!materials.ok) {
+        item.status = 'error';
+        item.error = materials.error || 'a aula não possui vídeo e o material não pôde ser salvo';
+        return;
+      }
+      let textSaved = null;
+      if (pageMeta.hasContent && pageMeta.contentText) {
+        const textName = `${sanitizeFilename(item.title, 'Conteudo')}.txt`;
+        const textUrl = `data:text/plain;charset=utf-8,${encodeURIComponent(pageMeta.contentText + '\r\n')}`;
+        textSaved = await saveChromeResource(textUrl, `${item.path}/${textName}`);
+        if (!textSaved.ok) {
+          item.status = 'error';
+          item.error = textSaved.error || 'não foi possível salvar o texto da aula';
+          return;
+        }
+      }
+      const hasSavedContent = Boolean(textSaved?.ok || materials.attachmentCount > 0);
+      if (!hasSavedContent) {
+        item.status = 'empty';
+        item.phase = null;
+        item.emptyReason = 'Aula declarada pela Hotmart sem vídeo, texto ou materiais';
+        item.skippedAt = Date.now();
+        return;
+      }
+      item.status = 'done';
+      item.phase = null;
+      item.filename = materials.filename || textSaved?.download?.filename?.split(/[\\/]/).pop() || null;
+      item.savedPath = materials.savedPath || textSaved?.download?.filename || null;
+      item.materialCount = Number(materials.attachmentCount || 0);
+      await markCompleted(item.url, {
+        filename: item.filename,
+        savedPath: item.savedPath,
+        downloadIds: [
+          ...(materials.downloadIds || []),
+          ...(Number.isInteger(textSaved?.downloadId) ? [textSaved.downloadId] : [])
+        ],
+        materialsCheckedAt: materials.scanComplete ? Date.now() : null,
+        materialsScanVersion: materials.scanComplete ? MATERIALS_SCAN_VERSION : null,
+        materialCount: item.materialCount
+      });
+      return;
+    }
     const diagnostics = detection.diagnostics || [];
     item.status = 'skipped';
     const videos = diagnostics.reduce((sum, frame) => sum + (frame.videoCount || 0), 0);
@@ -3728,7 +4604,10 @@ async function runBatchItem(item) {
       item.savedPath = finished.savedPath;
       item.container = finished.container;
       item.downloadIds = finished.downloadIds;
-      await markCompleted(item.url, { ...finished, validatedBonus: item.isBonus });
+      const completion = await addLessonMaterials(item, {
+        ...finished, validatedBonus: item.isBonus
+      });
+      await markCompleted(item.url, completion);
     } else if (!fallbackHls) {
       item.status = 'error';
       item.error = nativeErrors.slice(-3).join(' · ') || 'nenhuma fonte de vídeo pôde ser baixada';
@@ -3755,7 +4634,10 @@ async function runBatchItem(item) {
         item.filename = fallbackFinished.filename;
         item.savedPath = fallbackFinished.savedPath || null;
         item.container = fallbackFinished.container || null;
-        await markCompleted(item.url, { ...fallbackFinished, validatedBonus: true });
+        const completion = await addLessonMaterials(item, {
+          ...fallbackFinished, validatedBonus: true
+        });
+        await markCompleted(item.url, completion);
       } else if (fallbackFinished.status === 'canceled') {
         item.status = 'pending';
       } else {
@@ -3788,7 +4670,10 @@ async function runBatchItem(item) {
     item.filename = finished.filename;
     item.savedPath = finished.savedPath || null;
     item.container = finished.container || null;
-    await markCompleted(item.url, { ...finished, validatedBonus: item.isBonus });
+    const completion = await addLessonMaterials(item, {
+      ...finished, validatedBonus: item.isBonus
+    });
+    await markCompleted(item.url, completion);
   } else if (finished.status === 'canceled') {
     item.status = 'pending'; // fila cancelada: o item volta a fila
   } else if (isAuthorizationDownloadError(finished.error)) {
@@ -3807,7 +4692,10 @@ async function runBatchItem(item) {
       item.savedPath = nativeFinished.savedPath;
       item.container = nativeFinished.container;
       item.downloadIds = nativeFinished.downloadIds;
-      await markCompleted(item.url, { ...nativeFinished, validatedBonus: item.isBonus });
+      const completion = await addLessonMaterials(item, {
+        ...nativeFinished, validatedBonus: item.isBonus
+      });
+      await markCompleted(item.url, completion);
     } else {
       item.status = 'error';
       item.error = `${finished.error} · tentativa com Referer: ${nativeFinished.error}`;
@@ -3892,7 +4780,7 @@ async function pumpBatch() {
   }
 }
 
-async function startBatch({ tabId, courseTitle, items }) {
+async function startBatch({ tabId, courseTitle, items, mode = null }) {
   await loadBatch();
   if (batch && (batch.status === 'running' || batch.status === 'paused')) {
     return { ok: false, error: 'Ja existe uma fila em andamento.' };
@@ -3915,6 +4803,7 @@ async function startBatch({ tabId, courseTitle, items }) {
     id: `batch-${Date.now()}`,
     tabId,
     courseTitle,
+    mode: mode === 'materials' ? 'materials' : null,
     returnUrl,
     status: 'running',
     cursor: 0,
@@ -3937,6 +4826,7 @@ async function startBatch({ tabId, courseTitle, items }) {
       lessonIndex: item.lessonIndex,
       // Selecionada de proposito mesmo constando como baixada: refaz.
       force: Boolean(item.force),
+      materialsOnly: Boolean(item.materialsOnly),
       path: lessonPath(courseTitle, item),
       status: 'pending',
       phase: null,

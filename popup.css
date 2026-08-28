@@ -847,7 +847,7 @@ input[type='checkbox']:disabled {
 
 .actionbar-links {
   display: flex;
-  gap: 12px;
+  gap: 9px;
   min-width: 0;
 }
 

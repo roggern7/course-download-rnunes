@@ -486,8 +486,13 @@
     }
   }
 
-  // Grupos nomeados vencem o agrupamento generico quando ha duplicatas.
-  const ordered = [...grouped.entries()].sort(([a], [b]) => (a === 'Aulas') - (b === 'Aulas'));
+  // Grupos nomeados vencem agrupamentos genericos quando ha duplicatas. A
+  // Hotmart usa "Todos os conteudos" como uma visao parcial/lazy da secao
+  // aberta; se ela vier primeiro, rouba as URLs dos modulos reais.
+  const genericGroup = (title) => /^(?:aulas|todos os conte[uú]dos|all contents?)$/i.test(clean(title));
+  const ordered = [...grouped.entries()].sort(([a], [b]) =>
+    Number(genericGroup(a)) - Number(genericGroup(b))
+  );
   const used = new Set();
   const modules = [];
   for (const [title, lessonMap] of ordered) {

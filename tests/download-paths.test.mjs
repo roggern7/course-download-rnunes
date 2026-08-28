@@ -69,3 +69,10 @@ test('reconhece aula depois que o portal renomeia o curso', () => {
 
   assert.equal(downloadMatchesLesson(old, current, { videoOnly: true }), true);
 });
+
+test('ignora estado de reproducao e disponibilidade anexado ao titulo', () => {
+  const current = 'Course Downloader RNUNES/Fórmula Youtube 2026/Introdução ao YouTube/01 - Tocando agora Introdução ao Treinamento Disponível até 26-08-2027 às 23-59';
+  const saved = 'C:\\Users\\Test User\\Downloads\\Course Downloader RNUNES\\Peter Jordan 2026\\Alterar nome para Formula Youtube 2026\\01 - Introdução ao YouTube\\01 - Introdução ao Treinamento.ts';
+
+  assert.equal(downloadMatchesLesson(saved, current, { videoOnly: true }), true);
+});

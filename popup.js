@@ -11,8 +11,11 @@
  * com uma barra so. A logica de dados vive no service worker; aqui e so vista.
  */
 
-import { formatBytes, formatDuration } from './hls.js';
+import { formatBytes, formatDuration, sanitizeFilename } from './hls.js';
 import { isProtectedMediaError } from './batch-policy.js';
+import { downloadMatchesLesson } from './download-paths.js';
+
+const MATERIALS_SCAN_VERSION = 9;
 
 const $ = (id) => document.getElementById(id);
 
@@ -48,6 +51,7 @@ const courseBarEl = $('course-bar');
 const selectAllBtn = $('select-all');
 const selectNoneBtn = $('select-none');
 const rescanBtn = $('rescan');
+const downloadMaterialsBtn = $('download-materials');
 const forgetBtn = $('forget');
 const downloadSelectedBtn = $('download-selected');
 
@@ -155,7 +159,14 @@ function contarFila(batch) {
   return counts;
 }
 
-function resumoFila(c) {
+function resumoFila(c, batch = null) {
+  if (batch?.mode === 'materials') {
+    const partes = [];
+    if (c.done) partes.push(`${c.done} com materiais salvos`);
+    if (c.exists) partes.push(`${c.exists} sem materiais`);
+    if (c.error) partes.push(`${c.error} com erro`);
+    return partes.length ? partes.join(' · ') : 'nenhuma aula verificada';
+  }
   const partes = [plural(c.done, 'salvo', 'salvos')];
   if (c.exists) partes.push(`${c.exists} já salvos`);
   if (c.skipped) partes.push(`${c.skipped} sem video`);
@@ -181,7 +192,9 @@ function renderFila(batch, job) {
     batch.items.find((item) => item.status === 'locked' && item.error);
 
   if (rodando && atual) {
-    activityTitleEl.textContent = `Item ${batch.cursor + 1} de ${c.total}`;
+    activityTitleEl.textContent = batch.mode === 'materials'
+      ? `Verificando materiais · ${batch.cursor + 1} de ${c.total}`
+      : `Item ${batch.cursor + 1} de ${c.total}`;
     activityTitleEl.title = atual.title;
     activityEl.dataset.tone = 'queue';
   } else if (pausada) {
@@ -218,12 +231,12 @@ function renderFila(batch, job) {
     activityMetaEl.textContent = detalhes.join(' · ');
     activityMetaEl.title = atual.title;
   } else {
-    activityMetaEl.textContent = resumoFila(c);
+    activityMetaEl.textContent = resumoFila(c, batch);
     activityMetaEl.title = '';
   }
 
   if (terminada) {
-    const total = `${plural(c.total, 'item', 'itens')}: ${resumoFila(c)}.`;
+    const total = `${plural(c.total, 'item', 'itens')}: ${resumoFila(c, batch)}.`;
     if (batch.status === 'failed') {
       const detail = firstFailure ? ` Falha: ${firstFailure.error}.` : '';
       setNote(protectedFailure
@@ -640,6 +653,51 @@ function syncSelectionUi() {
     ? `Baixar ${plural(selected.size, 'item', 'itens')}`
     : 'Baixar';
   downloadSelectedBtn.disabled = !selected.size || busy();
+  const pendingMaterials = materialCandidates().length;
+  downloadMaterialsBtn.textContent = pendingMaterials
+    ? `Checar ${pendingMaterials} aulas`
+    : 'Materiais verificados';
+  downloadMaterialsBtn.disabled = !pendingMaterials || busy();
+}
+
+function materialCandidates() {
+  if (!course) return [];
+  const candidates = [];
+  const completedEntries = Object.values(data.completed || {});
+  const pad = (number) => String(number).padStart(2, '0');
+  course.modules.forEach((mod, moduleIndex) => {
+    mod.lessons.forEach((lesson, lessonIndex) => {
+      const numberedTitle = /^\d/.test(String(lesson.title).trim())
+        ? lesson.title
+        : `${pad(lessonIndex + 1)} - ${lesson.title}`;
+      const expectedPath = [
+        'Course Downloader RNUNES',
+        sanitizeFilename(course.courseTitle, 'Curso'),
+        sanitizeFilename(mod.title, `Modulo ${pad(moduleIndex + 1)}`),
+        sanitizeFilename(numberedTitle, `Aula ${pad(lessonIndex + 1)}`)
+      ].join('/');
+      const completed = (data.completed || {})[lesson.url] ||
+        completedEntries.find((entry) =>
+          entry?.path && downloadMatchesLesson(entry.path, expectedPath)
+        );
+      if (!completed) return;
+      if (
+          Number(completed.materialsScanVersion || 0) >= MATERIALS_SCAN_VERSION) return;
+      candidates.push({
+        url: lesson.url,
+        title: lesson.title,
+        kind: lesson.kind || null,
+        isBonus: Boolean(lesson.isBonus),
+        identifiers: lesson.identifiers || null,
+        moduleTitle: mod.title,
+        moduleIndex: moduleIndex + 1,
+        lessonIndex: lessonIndex + 1,
+        force: true,
+        materialsOnly: true
+      });
+    });
+  });
+  return candidates;
 }
 
 function setAllSelected(value) {
@@ -689,9 +747,29 @@ async function downloadSelected() {
   if (response?.ok) setView('progress');
 }
 
+async function downloadSavedMaterials() {
+  if (!course || !currentTab || busy()) return;
+  const items = materialCandidates();
+  if (!items.length) return;
+  const response = await send({
+    type: 'start-batch',
+    tabId: currentTab.id,
+    courseTitle: course.courseTitle,
+    mode: 'materials',
+    items
+  });
+  if (response && response.ok === false) {
+    activityEl.hidden = false;
+    setNote(response.error, 'error');
+  }
+  await refresh();
+  if (response?.ok) setView('progress');
+}
+
 selectAllBtn.addEventListener('click', () => setAllSelected(true));
 selectNoneBtn.addEventListener('click', () => setAllSelected(false));
 rescanBtn.addEventListener('click', () => loadCourse(true));
+downloadMaterialsBtn.addEventListener('click', downloadSavedMaterials);
 downloadSelectedBtn.addEventListener('click', downloadSelected);
 
 // Escotilha de emergencia: se o registro ficar dessincronizado do disco, zera.

@@ -17,6 +17,8 @@ function comparablePathPart(value) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/^\d+\s*-\s*/, '')
+    .replace(/^(?:tocando agora|reproduzindo agora|playing now)\s+/i, '')
+    .replace(/\s+disponivel(?:\s+(?:ate|em|a partir de))?(?:\s|$).*$/i, '')
     .replace(/ \(\d+\)$/, '')
     .trim()
     .toLocaleLowerCase('pt-BR');

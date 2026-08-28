@@ -236,3 +236,27 @@ test('Hotmart não transforma cartões resumidos de módulos em aulas', async ()
   assert.equal(result.ok, false);
   assert.equal(result.modules.length, 0);
 });
+
+test('Hotmart prioriza modulos reais sobre Todos os conteudos duplicado', async () => {
+  const lesson = (title, hash) => ({ title, hash, type: 'video' });
+  const first = lesson('Boas-vindas', 'aula-boas-vindas');
+  const second = lesson('Criando o canal', 'aula-criando-canal');
+  const state = {
+    genericNavigation: {
+      title: 'Todos os conteúdos',
+      lessons: [first, second]
+    },
+    modules: [
+      { title: 'Introdução', lessons: [first] },
+      { title: 'Prática', lessons: [second] }
+    ]
+  };
+
+  const result = await new vm.Script(script).runInContext(fakeHotmartPage(state));
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    Array.from(result.modules, (module) => module.title),
+    ['Introdução', 'Prática']
+  );
+  assert.equal(result.lessonCount, 2);
+});

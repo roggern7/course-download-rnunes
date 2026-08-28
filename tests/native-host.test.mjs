@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const {
   findCourseFiles,
   hlsDuration,
+  moveToRelative,
   normalizeMediaHeaders,
   placeInFolder,
   safeDownloadTarget,
@@ -128,6 +129,25 @@ test('organiza o MP4 do bonus dentro da pasta 03', (t) => {
   )), true);
 });
 
+test('move material baixado pela pagina para a pasta da aula', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'course-downloader-material-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const source = path.join(root, 'Material.pdf');
+  fs.writeFileSync(source, 'pdf');
+
+  const result = moveToRelative({
+    file: source,
+    directory: 'Course Downloader RNUNES/Curso/Modulo/01 - Aula'
+  }, root);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.output, path.join(
+    root, 'Course Downloader RNUNES', 'Curso', 'Modulo', '01 - Aula', 'Material.pdf'
+  ));
+  assert.equal(fs.existsSync(source), false);
+  assert.equal(fs.existsSync(result.output), true);
+});
+
 test('host recupera aula de curso renomeado dentro de pasta intermediaria', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'course-downloader-rename-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -151,4 +171,25 @@ test('host recupera aula de curso renomeado dentro de pasta intermediaria', (t) 
   }], root);
 
   assert.equal(result.matches.lesson, oldFile);
+});
+
+test('host ignora disponibilidade anexada ao nome escaneado', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'course-downloader-state-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const saved = path.join(
+    root, 'Course Downloader RNUNES', 'Fórmula Youtube 2026',
+    'Introdução ao YouTube', '01 - Introdução ao Treinamento.ts'
+  );
+  fs.mkdirSync(path.dirname(saved), { recursive: true });
+  fs.writeFileSync(saved, 'video');
+
+  const result = findCourseFiles([{
+    key: 'lesson',
+    bases: [
+      'Course Downloader RNUNES/Fórmula Youtube 2026/Introdução ao YouTube/01 - Tocando agora Introdução ao Treinamento Disponível até 26-08-2027 às 23-59'
+    ],
+    kind: 'video'
+  }], root);
+
+  assert.equal(result.matches.lesson, saved);
 });

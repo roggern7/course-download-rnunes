@@ -718,6 +718,8 @@ function comparableCourseName(value) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/^\d+\s*-\s*/, '')
+    .replace(/^(?:tocando agora|reproduzindo agora|playing now)\s+/i, '')
+    .replace(/\s+disponivel(?:\s+(?:ate|em|a partir de))?(?:\s|$).*$/i, '')
     .trim()
     .toLocaleLowerCase('pt-BR');
 }
@@ -911,6 +913,32 @@ function placeInFolder({ file, folderName }, downloadsRoot = path.join(os.homedi
   return { ok: true, output: destination, moved: true };
 }
 
+/** Move um download iniciado pela propria pagina para a pasta relativa da aula. */
+function moveToRelative({ file, directory }, downloadsRoot = path.join(os.homedir(), 'Downloads')) {
+  if (!file || typeof file !== 'string') return { ok: false, error: 'arquivo ausente' };
+  const root = path.resolve(downloadsRoot);
+  const source = path.resolve(file);
+  const targetDirectory = safeDownloadTarget(downloadsRoot, directory);
+  if (!targetDirectory) return { ok: false, error: 'pasta de destino invalida' };
+  if (source !== root && !source.startsWith(root + path.sep)) {
+    return { ok: false, error: 'arquivo fora de Downloads' };
+  }
+  if (!fs.existsSync(source) || !fs.statSync(source).isFile()) {
+    return { ok: false, error: 'arquivo nao encontrado' };
+  }
+  fs.mkdirSync(targetDirectory, { recursive: true });
+  let destination = path.join(targetDirectory, path.basename(source));
+  if (path.resolve(destination) === source) return { ok: true, output: source, moved: false };
+  if (fs.existsSync(destination)) {
+    const ext = path.extname(destination);
+    const base = destination.slice(0, -ext.length);
+    let index = 2;
+    while (fs.existsSync(destination)) destination = `${base} (${index++})${ext}`;
+  }
+  fs.renameSync(source, destination);
+  return { ok: true, output: destination, moved: true };
+}
+
 /* ---------------------------------------------------------------- *
  * Uma mensagem por execucao: e assim que sendNativeMessage funciona.
  * ---------------------------------------------------------------- */
@@ -985,6 +1013,9 @@ async function main() {
   if (pedido.action === 'place-in-folder') {
     return respond(placeInFolder(pedido));
   }
+  if (pedido.action === 'move-to-relative') {
+    return respond(moveToRelative(pedido));
+  }
   return respond({ ok: false, error: `acao desconhecida: ${pedido.action}` });
 }
 
@@ -997,6 +1028,7 @@ if (require.main === module) {
 module.exports = {
   downloadMedia,
   findCourseFiles,
+  moveToRelative,
   placeInFolder,
   safeDownloadTarget,
   hlsDuration,
